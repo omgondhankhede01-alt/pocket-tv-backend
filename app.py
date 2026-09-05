@@ -5,6 +5,7 @@ import asyncio
 import threading
 import json
 from flask import Flask, jsonify
+from flask_cors import CORS  # <-- CORS Bypass added here
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from google.oauth2 import service_account
@@ -31,6 +32,7 @@ if not os.path.exists(MOVIES_TXT):
 # FLASK WEB SERVER & API
 # ==========================================
 web_app = Flask(__name__)
+CORS(web_app)  # <-- CORS Bypass activated here!
 
 def get_drive_files():
     creds_json = os.environ.get("GCP_CREDENTIALS", "")
@@ -161,18 +163,15 @@ def get_best_option(options_list, movie_title=""):
 # ==========================================
 async def download_worker():
     if not SESSION_STRING:
-        print("[ERROR] TG_SESSION environment variable is missing! App cannot log into Telegram.")
+        print("[ERROR] TG_SESSION environment variable is missing!")
         return
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    print("\n[TELEGRAM] Connecting to Telegram using Session String...")
     await client.connect()
     
     if not await client.is_user_authorized():
-        print("[ERROR] Session string is invalid or expired. Please regenerate your session string.")
+        print("[ERROR] Session string is invalid.")
         return
-        
-    print("[TELEGRAM] Connected and authorized successfully!\n")
 
     while True:
         try:
@@ -188,13 +187,10 @@ async def download_worker():
                 continue
 
             query = queries[0]
-            print(f"\n[ENGINE] Processing: {query}")
-            
             success = False
+            
             for target_bot in BOT_USERNAMES:
                 if success: break
-                
-                print(f"[TELEGRAM] Trying bot: {target_bot}")
                 try:
                     await client.send_message(target_bot, "/start")
                     await asyncio.sleep(2) 
@@ -203,14 +199,6 @@ async def download_worker():
                         await conv.send_message(query)
                         await asyncio.sleep(1)
                         
-                        if target_bot == "@iPopcornMBot":
-                            try:
-                                await conv.get_response(timeout=3)
-                            except asyncio.TimeoutError:
-                                pass
-                            await conv.send_message("/start")
-                            await asyncio.sleep(2)
-                            
                         res = await conv.get_response()
                         
                         for step in range(3):
@@ -218,11 +206,7 @@ async def download_worker():
                                 
                             starts = re.findall(r'(/start\s+[a-zA-Z0-9_-]+)', res.raw_text)
                             if starts:
-                                options = []
-                                for line in res.raw_text.split('\n'):
-                                    match = re.search(r'(/start\s+[a-zA-Z0-9_-]+)', line)
-                                    if match: options.append((line, match.group(1)))
-                                
+                                options = [(line, re.search(r'(/start\s+[a-zA-Z0-9_-]+)', line).group(1)) for line in res.raw_text.split('\n') if re.search(r'(/start\s+[a-zA-Z0-9_-]+)', line)]
                                 chosen_start = get_best_option(options, query) or starts[0]
                                 await conv.send_message(chosen_start)
                                 await asyncio.sleep(2)
@@ -257,25 +241,18 @@ async def download_worker():
                                     break
                         
                         if not msg or not msg.media:
-                            print(f"[TELEGRAM] {target_bot} returned no valid media. Moving to next bot...")
                             continue 
                         
                         file_name = msg.file.name or f"{query}.mp4"
-                        
                         if re.search(r'\bs\d{1,2}\s?e\d{1,2}\b', file_name.lower()):
-                            print(f"[TELEGRAM] WARNING: Series file detected. Skipping...")
                             continue
 
-                        print(f"[TELEGRAM] Downloading '{file_name}'...")
                         download_path = await msg.download_media(file=file_name)
-                        
                         if os.path.exists(download_path) and os.path.getsize(download_path) < 10 * 1024 * 1024:
-                            print(f"[ERROR] Downloaded file is too small. Rejecting...")
                             os.remove(download_path)
                             continue
 
                         upload_success = upload_to_drive(download_path)
-                        
                         if upload_success:
                             remaining = queries[1:]
                             with open(MOVIES_TXT, "w", encoding="utf-8") as f:
@@ -283,17 +260,15 @@ async def download_worker():
                                 success = True
                         
                 except Exception as e:
-                    print(f"[ERROR with {target_bot}] {e}")
+                    pass
             
             if not success:
-                print(f"❌ [ERROR] All bots failed for '{query}'. Moving past it.")
                 remaining = queries[1:]
                 with open(MOVIES_TXT, "w", encoding="utf-8") as f:
                     f.write("\n".join(remaining) + "\n")
                     
             await asyncio.sleep(10)
         except Exception as loop_error:
-            print(f"[WORKER ERROR] {loop_error}")
             await asyncio.sleep(10)
 
 def run_loop():
@@ -305,5 +280,4 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_loop)
     t.daemon = True
     t.start()
-    
     run_web()
