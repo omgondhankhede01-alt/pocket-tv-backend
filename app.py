@@ -4,7 +4,7 @@ import shutil
 import asyncio
 import threading
 import json
-from flask import Flask, render_template_string
+from flask import Flask, jsonify
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from google.oauth2 import service_account
@@ -28,148 +28,9 @@ if not os.path.exists(MOVIES_TXT):
         f.write("Inception\nInterstellar\n")
 
 # ==========================================
-# FLASK WEB SERVER & UI
+# FLASK WEB SERVER & API
 # ==========================================
 web_app = Flask(__name__)
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pocket TV - Cloud Library</title>
-    <style>
-        :root {
-            --bg-color: #0f172a;
-            --card-bg: #1e293b;
-            --border-color: #334155;
-            --accent-color: #38bdf8;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-        }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            margin: 0;
-            padding: 20px;
-        }
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
-        }
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 2px solid var(--border-color);
-            padding-bottom: 15px;
-            margin-bottom: 25px;
-        }
-        h1 {
-            margin: 0;
-            font-size: 24px;
-            color: var(--accent-color);
-        }
-        .status-badge {
-            background-color: #065f46;
-            color: #6ee7b7;
-            padding: 6px 12px;
-            border-radius: 20px;
-            font-size: 14px;
-            border: 1px solid #047857;
-        }
-        .file-grid {
-            display: grid;
-            gap: 15px;
-        }
-        .file-card {
-            background-color: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 10px;
-            padding: 15px 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            transition: border-color 0.2s ease;
-        }
-        .file-card:hover {
-            border-color: var(--accent-color);
-        }
-        .file-info {
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
-        .file-name {
-            font-size: 16px;
-            font-weight: 600;
-        }
-        .file-meta {
-            font-size: 13px;
-            color: var(--text-muted);
-        }
-        .actions {
-            display: flex;
-            gap: 10px;
-        }
-        .btn {
-            background-color: var(--accent-color);
-            color: #0f172a;
-            padding: 8px 16px;
-            border-radius: 6px;
-            text-decoration: none;
-            font-weight: 600;
-            font-size: 14px;
-            transition: opacity 0.2s;
-        }
-        .btn:hover {
-            opacity: 0.9;
-        }
-        .empty-state {
-            text-align: center;
-            padding: 40px;
-            color: var(--text-muted);
-            border: 2px dashed var(--border-color);
-            border-radius: 10px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>Pocket TV Library</h1>
-            <div class="status-badge">🟢 Cloud Live & Synced</div>
-        </header>
-
-        <div class="file-grid">
-            {% if files %}
-                {% for file in files %}
-                <div class="file-card">
-                    <div class="file-info">
-                        <span class="file-name">🎬 {{ file.name }}</span>
-                        <span class="file-meta">Google Drive Cloud Storage</span>
-                    </div>
-                    <div class="actions">
-                        <a href="{{ file.webViewLink }}" target="_blank" class="btn">Open / View</a>
-                        {% if file.webContentLink %}
-                        <a href="{{ file.webContentLink }}" class="btn" style="background-color: #10b981; color: white;">Download</a>
-                        {% endif %}
-                    </div>
-                </div>
-                {% endfor %}
-            {% else %}
-                <div class="empty-state">
-                    <h3>No movies found in your Drive folder yet!</h3>
-                    <p>Add movie names to your <code>movies_to_download.txt</code> queue, and they will automatically appear here once uploaded.</p>
-                </div>
-            {% endif %}
-        </div>
-    </div>
-</body>
-</html>
-"""
 
 def get_drive_files():
     creds_json = os.environ.get("GCP_CREDENTIALS", "")
@@ -199,8 +60,19 @@ def get_drive_files():
 
 @web_app.route('/')
 def home():
+    return "Pocket TV Backend Engine is running and ready for Cloudflare!"
+
+@web_app.route('/api/files')
+def api_files():
     files = get_drive_files()
-    return render_template_string(HTML_TEMPLATE, files=files)
+    file_list = []
+    for f in files:
+        file_list.append({
+            "name": f.get("name"),
+            "webViewLink": f.get("webViewLink"),
+            "webContentLink": f.get("webContentLink", "#")
+        })
+    return jsonify(file_list)
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -402,7 +274,6 @@ async def download_worker():
                             os.remove(download_path)
                             continue
 
-                        # Upload straight to Google Drive & cleanup local storage
                         upload_success = upload_to_drive(download_path)
                         
                         if upload_success:
