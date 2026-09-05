@@ -3,9 +3,13 @@ import re
 import shutil
 import asyncio
 import threading
-from flask import Flask
+import json
+from flask import Flask, render_template_string
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 # ==========================================
 # CONFIGURATION
@@ -24,18 +28,228 @@ if not os.path.exists(MOVIES_TXT):
         f.write("Inception\nInterstellar\n")
 
 # ==========================================
-# FLASK WEB SERVER (Keeps Render Alive)
+# FLASK WEB SERVER & UI
 # ==========================================
 web_app = Flask(__name__)
 
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pocket TV - Cloud Library</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --border-color: #334155;
+            --accent-color: #38bdf8;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 15px;
+            margin-bottom: 25px;
+        }
+        h1 {
+            margin: 0;
+            font-size: 24px;
+            color: var(--accent-color);
+        }
+        .status-badge {
+            background-color: #065f46;
+            color: #6ee7b7;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            border: 1px solid #047857;
+        }
+        .file-grid {
+            display: grid;
+            gap: 15px;
+        }
+        .file-card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: border-color 0.2s ease;
+        }
+        .file-card:hover {
+            border-color: var(--accent-color);
+        }
+        .file-info {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .file-name {
+            font-size: 16px;
+            font-weight: 600;
+        }
+        .file-meta {
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+        .actions {
+            display: flex;
+            gap: 10px;
+        }
+        .btn {
+            background-color: var(--accent-color);
+            color: #0f172a;
+            padding: 8px 16px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 14px;
+            transition: opacity 0.2s;
+        }
+        .btn:hover {
+            opacity: 0.9;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+            border: 2px dashed var(--border-color);
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Pocket TV Library</h1>
+            <div class="status-badge">🟢 Cloud Live & Synced</div>
+        </header>
+
+        <div class="file-grid">
+            {% if files %}
+                {% for file in files %}
+                <div class="file-card">
+                    <div class="file-info">
+                        <span class="file-name">🎬 {{ file.name }}</span>
+                        <span class="file-meta">Google Drive Cloud Storage</span>
+                    </div>
+                    <div class="actions">
+                        <a href="{{ file.webViewLink }}" target="_blank" class="btn">Open / View</a>
+                        {% if file.webContentLink %}
+                        <a href="{{ file.webContentLink }}" class="btn" style="background-color: #10b981; color: white;">Download</a>
+                        {% endif %}
+                    </div>
+                </div>
+                {% endfor %}
+            {% else %}
+                <div class="empty-state">
+                    <h3>No movies found in your Drive folder yet!</h3>
+                    <p>Add movie names to your <code>movies_to_download.txt</code> queue, and they will automatically appear here once uploaded.</p>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+def get_drive_files():
+    creds_json = os.environ.get("GCP_CREDENTIALS", "")
+    folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
+    
+    if not creds_json or not folder_id:
+        return []
+
+    try:
+        creds_dict = json.loads(creds_json)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict, scopes=['https://www.googleapis.com/auth/drive']
+        )
+        service = build('drive', 'v3', credentials=creds)
+
+        query = f"'{folder_id}' in parents and trashed = false"
+        results = service.files().list(
+            q=query, 
+            pageSize=100, 
+            fields="files(id, name, webViewLink, webContentLink, size)"
+        ).execute()
+        
+        return results.get('files', [])
+    except Exception as e:
+        print(f"[DRIVE LIST ERROR] {e}")
+        return []
+
 @web_app.route('/')
 def home():
-    return "Pocket TV Downloader is active and running 24/7!"
+    files = get_drive_files()
+    return render_template_string(HTML_TEMPLATE, files=files)
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     print(f"[WEB] Starting Flask server on port {port}...")
     web_app.run(host="0.0.0.0", port=port)
+
+# ==========================================
+# GOOGLE DRIVE UPLOAD HELPER
+# ==========================================
+def upload_to_drive(file_path):
+    creds_json = os.environ.get("GCP_CREDENTIALS", "")
+    folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
+    
+    if not creds_json or not folder_id:
+        print("[DRIVE ERROR] GCP_CREDENTIALS or DRIVE_FOLDER_ID missing! Skipping upload.")
+        return False
+
+    try:
+        creds_dict = json.loads(creds_json)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict, scopes=['https://www.googleapis.com/auth/drive']
+        )
+        service = build('drive', 'v3', credentials=creds)
+
+        file_name = os.path.basename(file_path)
+        print(f"[DRIVE] Uploading '{file_name}' to Google Drive...")
+
+        file_metadata = {
+            'name': file_name,
+            'parents': [folder_id]
+        }
+        media = MediaFileUpload(file_path, resumable=True)
+        
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id'
+        ).execute()
+
+        print(f"☁️ [SUCCESS] Uploaded to Google Drive! File ID: {file.get('id')}")
+        
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            print(f"[CLEANUP] Deleted local file: {file_name}")
+            
+        return True
+    except Exception as e:
+        print(f"[DRIVE ERROR] Failed to upload {file_path}: {e}")
+        return False
 
 # ==========================================
 # SMART SCORING ENGINE
@@ -188,15 +402,14 @@ async def download_worker():
                             os.remove(download_path)
                             continue
 
-                        dest_path = os.path.join(DRIVE_FOLDER_PATH, file_name)
-                        shutil.move(download_path, dest_path)
-                        print(f"🎉 [SUCCESS] Saved {file_name}!")
+                        # Upload straight to Google Drive & cleanup local storage
+                        upload_success = upload_to_drive(download_path)
                         
-                        remaining = queries[1:]
-                        with open(MOVIES_TXT, "w", encoding="utf-8") as f:
-                            f.write("\n".join(remaining) + "\n")
-                            
-                        success = True
+                        if upload_success:
+                            remaining = queries[1:]
+                            with open(MOVIES_TXT, "w", encoding="utf-8") as f:
+                                f.write("\n".join(remaining) + "\n")
+                                success = True
                         
                 except Exception as e:
                     print(f"[ERROR with {target_bot}] {e}")
