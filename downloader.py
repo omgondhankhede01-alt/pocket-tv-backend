@@ -52,63 +52,84 @@ async def download_worker():
     await client.connect()
 
     print(f"Connected to Telegram. Searching for: '{MOVIE_QUERY}'")
-    
+    query_words = MOVIE_QUERY.lower().split()
     msg = None
     
-    # Loop through the bots one by one
     for target_bot in BOT_USERNAMES:
         print(f"\n--- Trying bot: {target_bot} ---")
         await client.send_message(target_bot, MOVIE_QUERY)
         
-        clicked_messages = set() # Keep track of buttons we've already clicked
+        clicked_messages = set()
         
-        # Wait up to 40 seconds per bot for a response
-        for _ in range(20):
+        # Increased to 30 loops (60 seconds) to allow time for multiple menu clicks
+        for _ in range(30):
             await asyncio.sleep(2)
-            history = await client.get_messages(target_bot, limit=5)
+            history = await client.get_messages(target_bot, limit=10)
             
             for m in history:
                 if m.out:
-                    continue # Skip our own messages
+                    continue 
                 
-                # Success! The bot sent the actual video file
+                # Success! We found the video file
                 if m.video or m.document:
                     msg = m
                     break
                 
-                # The bot sent a menu with buttons!
+                # The bot sent a menu with buttons
                 if m.buttons and m.id not in clicked_messages:
-                    print("Bot sent a menu with buttons. Clicking the first option...")
-                    try:
-                        # click(0) presses the very first button in the menu
+                    print("Menu detected. Reading buttons...")
+                    button_clicked = False
+                    
+                    for row in m.buttons:
+                        for button in row:
+                            if not button.text: continue
+                            btn_text = button.text.lower()
+                            
+                            # 1. Look for quality or file type (if it's a quality selection menu)
+                            if any(q in btn_text for q in ["1080", "720", "480", "2160", "mkv", "mp4", "hevc"]):
+                                print(f"--> Found quality option: '{button.text}'. Clicking it!")
+                                await button.click()
+                                button_clicked = True
+                                break
+                            
+                            # 2. Look for the movie name in the button text
+                            if all(word in btn_text for word in query_words):
+                                print(f"--> Found matching movie: '{button.text}'. Clicking it!")
+                                await button.click()
+                                button_clicked = True
+                                break
+                        
+                        if button_clicked:
+                            break
+                    
+                    # Fallback: If no exact match is found, just click the first button so it doesn't freeze
+                    if not button_clicked and m.buttons:
+                        first_btn = m.buttons[0][0].text
+                        print(f"--> No exact match found. Falling back to first option: '{first_btn}'")
                         await m.click(0)
-                        clicked_messages.add(m.id)
-                    except Exception as e:
-                        print(f"Could not click button: {e}")
+                        
+                    clicked_messages.add(m.id)
             
-            # If we found the video file, break out of the waiting loop
             if msg:
                 break
         
-        # If we found the video, break out of the bot loop
         if msg:
             print(f"Video acquired from {target_bot}!")
             break
         else:
             print(f"Failed to get video from {target_bot}. Moving to next bot...")
 
-    # If ALL bots failed
     if not msg:
         print("\nAll bots failed to return a video file.")
         sync_movies_json()
         return
 
-    # Download from Telegram to runner disk
+    # Download from Telegram
     file_name = getattr(msg.file, 'name', None) or f"{MOVIE_QUERY}.mp4"
     print(f"\nDownloading {file_name} on GitHub runner...")
     download_path = await msg.download_media(file=file_name)
     
-    # Upload straight to Google Drive
+    # Upload to Google Drive
     print(f"Uploading {file_name} to Google Drive...")
     service = get_drive_service()
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
@@ -116,12 +137,10 @@ async def download_worker():
     media = MediaFileUpload(download_path, resumable=True)
     service.files().create(body=file_metadata, media_body=media, fields='id').execute()
     
-    # Clean up runner disk
     if os.path.exists(download_path):
         os.remove(download_path)
     print("Upload complete!")
 
-    # Update movies.json
     sync_movies_json()
 
 if __name__ == "__main__":
