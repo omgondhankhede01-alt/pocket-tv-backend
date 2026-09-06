@@ -1,0 +1,45 @@
+name: Cloud Movie Downloader
+
+# This allows Cloudflare to trigger this action directly via an API request
+on:
+  workflow_dispatch:
+    inputs:
+      movie_name:
+        description: 'Name of the movie to download'
+        required: true
+        type: string
+
+jobs:
+  download_and_sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to commit the updated movies.json back to your repo
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install telethon google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
+      - name: Run Downloader & Upload to Drive
+        env:
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          MOVIE_NAME: ${{ inputs.movie_name }}
+        run: python downloader.py
+
+      - name: Commit Updated movies.json
+        run: |
+          git config --global user.name "PocketFlix Bot"
+          git config --global user.email "bot@pocketflix.local"
+          git add movies.json
+          git commit -m "Auto-updated movie library from Drive" || echo "No changes to commit"
+          git push
