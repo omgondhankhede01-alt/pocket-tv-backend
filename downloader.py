@@ -53,37 +53,62 @@ async def download_worker():
 
     print(f"Connected to Telegram. Searching for: '{MOVIE_QUERY}'")
     
-    target_bot = BOT_USERNAMES[0] # Starts with @iPapkornA2bot
-    print(f"Sending message to {target_bot}...")
-    
-    # 1. Send the movie name directly to your bot
-    await client.send_message(target_bot, MOVIE_QUERY)
-    
-    # 2. Wait up to 30 seconds for the bot to reply with the media file
-    print("Waiting for bot response...")
     msg = None
-    for _ in range(15):
-        await asyncio.sleep(2)
-        history = await client.get_messages(target_bot, limit=3)
-        for m in history:
-            # Look for a video or document sent by the bot
-            if m and (m.video or m.document) and not m.out:
-                msg = m
+    
+    # Loop through the bots one by one
+    for target_bot in BOT_USERNAMES:
+        print(f"\n--- Trying bot: {target_bot} ---")
+        await client.send_message(target_bot, MOVIE_QUERY)
+        
+        clicked_messages = set() # Keep track of buttons we've already clicked
+        
+        # Wait up to 40 seconds per bot for a response
+        for _ in range(20):
+            await asyncio.sleep(2)
+            history = await client.get_messages(target_bot, limit=5)
+            
+            for m in history:
+                if m.out:
+                    continue # Skip our own messages
+                
+                # Success! The bot sent the actual video file
+                if m.video or m.document:
+                    msg = m
+                    break
+                
+                # The bot sent a menu with buttons!
+                if m.buttons and m.id not in clicked_messages:
+                    print("Bot sent a menu with buttons. Clicking the first option...")
+                    try:
+                        # click(0) presses the very first button in the menu
+                        await m.click(0)
+                        clicked_messages.add(m.id)
+                    except Exception as e:
+                        print(f"Could not click button: {e}")
+            
+            # If we found the video file, break out of the waiting loop
+            if msg:
                 break
+        
+        # If we found the video, break out of the bot loop
         if msg:
+            print(f"Video acquired from {target_bot}!")
             break
+        else:
+            print(f"Failed to get video from {target_bot}. Moving to next bot...")
 
+    # If ALL bots failed
     if not msg:
-        print("No video file received from bot within timeout.")
+        print("\nAll bots failed to return a video file.")
         sync_movies_json()
         return
 
-    # 3. Download from Telegram to runner disk
+    # Download from Telegram to runner disk
     file_name = getattr(msg.file, 'name', None) or f"{MOVIE_QUERY}.mp4"
-    print(f"Downloading {file_name} on GitHub runner...")
+    print(f"\nDownloading {file_name} on GitHub runner...")
     download_path = await msg.download_media(file=file_name)
     
-    # 4. Upload straight to Google Drive
+    # Upload straight to Google Drive
     print(f"Uploading {file_name} to Google Drive...")
     service = get_drive_service()
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
@@ -96,7 +121,7 @@ async def download_worker():
         os.remove(download_path)
     print("Upload complete!")
 
-    # 5. Update movies.json
+    # Update movies.json
     sync_movies_json()
 
 if __name__ == "__main__":
