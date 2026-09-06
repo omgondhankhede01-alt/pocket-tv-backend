@@ -66,16 +66,19 @@ async def download_worker():
         print(f"Now processing: '{current_movie}'")
         print(f"==============================================")
         
+        # 1. FORCE HINDI: Append "Hindi" to every single search query
+        query_sent = f"{current_movie} Hindi"
         query_words = current_movie.lower().split()
         msg = None
         
         for target_bot in BOT_USERNAMES:
-            print(f"\n--- Trying bot: {target_bot} for '{current_movie}' ---")
-            await client.send_message(target_bot, current_movie)
+            print(f"\n--- Trying bot: {target_bot} with query '{query_sent}' ---")
+            await client.send_message(target_bot, query_sent)
             
             clicked_messages = set()
             
-            for _ in range(30):
+            # We allow up to 40 checks to give menus time to load
+            for _ in range(40):
                 await asyncio.sleep(2)
                 history = await client.get_messages(target_bot, limit=10)
                 
@@ -87,42 +90,40 @@ async def download_worker():
                         msg = m
                         break
                     
+                    # 2. DYNAMIC BUTTON SCORING (Handles ANY bot menu)
                     if m.buttons and m.id not in clicked_messages:
-                        print("Menu detected. Reading buttons...")
-                        button_clicked = False
+                        best_btn = None
+                        best_score = -1
                         
                         for row in m.buttons:
-                            for button in row:
-                                if not button.text: continue
-                                btn_text = button.text.lower()
+                            for btn in row:
+                                if not btn.text: continue
+                                t = btn.text.lower()
+                                score = 0
                                 
-                                if "mp4" in btn_text or "h.264" in btn_text:
-                                    print(f"--> Found MP4 format: '{button.text}'. Clicking it!")
-                                    await button.click()
-                                    button_clicked = True
-                                    break
+                                # Highly prioritize Hindi options
+                                if "hindi" in t or "dual" in t: score += 10
+                                # Prioritize exact movie name matches (for search result menus)
+                                if all(w in t for w in query_words): score += 8
+                                # Prioritize TV-safe MP4 formats
+                                if "mp4" in t or "h.264" in t: score += 5
+                                # General resolutions
+                                if "720" in t or "480" in t or "1080" in t: score += 3
                                 
-                                if any(q in btn_text for q in ["720", "480", "1080"]):
-                                    print(f"--> Found resolution option: '{button.text}'. Clicking it!")
-                                    await button.click()
-                                    button_clicked = True
-                                    break
-                                
-                                if all(word in btn_text for word in query_words):
-                                    print(f"--> Found matching movie: '{button.text}'. Clicking it!")
-                                    await button.click()
-                                    button_clicked = True
-                                    break
-                            
-                            if button_clicked:
-                                break
+                                if score > best_score:
+                                    best_score = score
+                                    best_btn = btn
                         
-                        if not button_clicked and m.buttons:
-                            first_btn = m.buttons[0][0].text
-                            print(f"--> No exact match found. Falling back to first option: '{first_btn}'")
-                            await m.click(0)
-                            
-                        clicked_messages.add(m.id)
+                        if best_btn and best_score > 0:
+                            print(f"--> Smart clicking button: '{best_btn.text}' (Score: {best_score})")
+                            await best_btn.click()
+                            clicked_messages.add(m.id)
+                        elif m.buttons:
+                            # Fallback if no keywords match
+                            first_btn = m.buttons[0][0]
+                            print(f"--> No keywords matched. Clicking first button: '{first_btn.text}'")
+                            await first_btn.click()
+                            clicked_messages.add(m.id)
                 
                 if msg:
                     break
@@ -141,16 +142,16 @@ async def download_worker():
         print(f"\nDownloading {raw_file_name} on GitHub runner...")
         download_path = await msg.download_media(file=raw_file_name)
         
-        # --- THE TV-SAFE CONVERSION STEP ---
+        # --- 3. HIGH-SPEED TV-SAFE CONVERSION ---
         base_name, _ = os.path.splitext(raw_file_name)
         safe_file_name = base_name + ".mp4"
         safe_download_path = "converted_" + safe_file_name
 
-        print(f"Converting file to TV-Safe H.264/AAC MP4 using FFmpeg...")
-        # This command forces conversion to standard H.264 video and AAC audio that any Vewd browser handles
+        print(f"Converting file using HIGH-SPEED FFmpeg Profile...")
+        # -preset ultrafast and -threads 0 speed up the process massively
         ffmpeg_cmd = [
             "ffmpeg", "-i", download_path,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "0",
             "-c:a", "aac", "-b:a", "128k",
             safe_download_path
         ]
@@ -168,7 +169,6 @@ async def download_worker():
             final_path = download_path
             final_name = raw_file_name
 
-        # Upload to Google Drive
         print(f"Uploading {final_name} to Google Drive...")
         service = get_drive_service()
         folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
