@@ -30,7 +30,9 @@ jobs:
       - name: Run Downloader & Upload to Drive
         env:
           TG_SESSION: ${{ secrets.TG_SESSION }}
-          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+          GCP_CLIENT_ID: ${{ secrets.GCP_CLIENT_ID }}
+          GCP_CLIENT_SECRET: ${{ secrets.GCP_CLIENT_SECRET }}
+          GCP_REFRESH_TOKEN: ${{ secrets.GCP_REFRESH_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           MOVIE_NAME: ${{ inputs.movie_name }}
         run: python downloader.py
