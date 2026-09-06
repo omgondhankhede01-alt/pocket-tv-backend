@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import asyncio
+import subprocess
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from google.oauth2.credentials import Credentials
@@ -54,14 +55,12 @@ async def download_worker():
         print("Missing TG_SESSION or MOVIE_NAME environment variable!")
         sys.exit(1)
 
-    # Split the comma-separated string into a batch list
     movie_list = [m.strip() for m in RAW_MOVIE_QUERY.split(",") if m.strip()]
     print(f"Batch processing {len(movie_list)} movies: {movie_list}")
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.connect()
 
-    # Loop through the list of movies
     for current_movie in movie_list:
         print(f"\n==============================================")
         print(f"Now processing: '{current_movie}'")
@@ -97,8 +96,14 @@ async def download_worker():
                                 if not button.text: continue
                                 btn_text = button.text.lower()
                                 
-                                if any(q in btn_text for q in ["1080", "720", "480", "2160", "mkv", "mp4", "hevc"]):
-                                    print(f"--> Found quality option: '{button.text}'. Clicking it!")
+                                if "mp4" in btn_text or "h.264" in btn_text:
+                                    print(f"--> Found MP4 format: '{button.text}'. Clicking it!")
+                                    await button.click()
+                                    button_clicked = True
+                                    break
+                                
+                                if any(q in btn_text for q in ["720", "480", "1080"]):
+                                    print(f"--> Found resolution option: '{button.text}'. Clicking it!")
                                     await button.click()
                                     button_clicked = True
                                     break
@@ -132,24 +137,49 @@ async def download_worker():
             print(f"\nAll bots failed to return a video file for '{current_movie}'. Skipping...")
             continue 
 
-        # Download
-        file_name = getattr(msg.file, 'name', None) or f"{current_movie.replace(' ', '_')}.mp4"
-        print(f"\nDownloading {file_name} on GitHub runner...")
-        download_path = await msg.download_media(file=file_name)
+        raw_file_name = getattr(msg.file, 'name', None) or f"{current_movie.replace(' ', '_')}.mp4"
+        print(f"\nDownloading {raw_file_name} on GitHub runner...")
+        download_path = await msg.download_media(file=raw_file_name)
         
-        # Upload
-        print(f"Uploading {file_name} to Google Drive...")
+        # --- THE TV-SAFE CONVERSION STEP ---
+        base_name, _ = os.path.splitext(raw_file_name)
+        safe_file_name = base_name + ".mp4"
+        safe_download_path = "converted_" + safe_file_name
+
+        print(f"Converting file to TV-Safe H.264/AAC MP4 using FFmpeg...")
+        # This command forces conversion to standard H.264 video and AAC audio that any Vewd browser handles
+        ffmpeg_cmd = [
+            "ffmpeg", "-i", download_path,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            safe_download_path
+        ]
+        
+        process = subprocess.run(ffmpeg_cmd)
+        
+        if process.returncode == 0:
+            print("Conversion successful!")
+            if os.path.exists(download_path):
+                os.remove(download_path)
+            final_path = safe_download_path
+            final_name = safe_file_name
+        else:
+            print("Conversion warning: FFmpeg failed, uploading original file...")
+            final_path = download_path
+            final_name = raw_file_name
+
+        # Upload to Google Drive
+        print(f"Uploading {final_name} to Google Drive...")
         service = get_drive_service()
         folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
-        file_metadata = {'name': file_name, 'parents': [folder_id]}
-        media = MediaFileUpload(download_path, resumable=True)
+        file_metadata = {'name': final_name, 'parents': [folder_id]}
+        media = MediaFileUpload(final_path, resumable=True)
         service.files().create(body=file_metadata, media_body=media, fields='id').execute()
         
-        if os.path.exists(download_path):
-            os.remove(download_path)
+        if os.path.exists(final_path):
+            os.remove(final_path)
         print(f"Upload complete for '{current_movie}'!")
 
-    # Sync JSON exactly once at the end of the entire batch
     print("\nBatch complete! Syncing final library state...")
     sync_movies_json()
 
