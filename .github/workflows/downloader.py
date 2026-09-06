@@ -4,7 +4,7 @@ import json
 import asyncio
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
@@ -15,10 +15,17 @@ BOT_USERNAMES = ["@iPapkornA2bot", "@iPopcornMBot", "@kevinhartrobot"]
 MOVIE_QUERY = os.environ.get("MOVIE_NAME", "")
 
 def get_drive_service():
-    creds_json = os.environ.get("GCP_CREDENTIALS", "")
-    creds_dict = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict, scopes=['https://www.googleapis.com/auth/drive']
+    client_id = os.environ.get("GCP_CLIENT_ID", "")
+    client_secret = os.environ.get("GCP_CLIENT_SECRET", "")
+    refresh_token = os.environ.get("GCP_REFRESH_TOKEN", "")
+    
+    # This logs into Google Drive as YOU using the new OAuth secrets
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret
     )
     return build('drive', 'v3', credentials=creds)
 
@@ -61,7 +68,7 @@ async def download_worker():
         
         clicked_messages = set()
         
-        # Increased to 30 loops (60 seconds) to allow time for multiple menu clicks
+        # 60 seconds to allow time for multiple menu clicks
         for _ in range(30):
             await asyncio.sleep(2)
             history = await client.get_messages(target_bot, limit=10)
@@ -85,7 +92,7 @@ async def download_worker():
                             if not button.text: continue
                             btn_text = button.text.lower()
                             
-                            # 1. Look for quality or file type (if it's a quality selection menu)
+                            # 1. Look for quality or file type
                             if any(q in btn_text for q in ["1080", "720", "480", "2160", "mkv", "mp4", "hevc"]):
                                 print(f"--> Found quality option: '{button.text}'. Clicking it!")
                                 await button.click()
@@ -102,7 +109,7 @@ async def download_worker():
                         if button_clicked:
                             break
                     
-                    # Fallback: If no exact match is found, just click the first button so it doesn't freeze
+                    # Fallback: click the first button so it doesn't freeze
                     if not button_clicked and m.buttons:
                         first_btn = m.buttons[0][0].text
                         print(f"--> No exact match found. Falling back to first option: '{first_btn}'")
