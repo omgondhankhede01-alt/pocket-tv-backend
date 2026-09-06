@@ -8,6 +8,11 @@ on:
         required: true
         type: string
 
+# THIS PREVENTS TELEGRAM CRASHES BY FORCING A QUEUE
+concurrency: 
+  group: telegram-downloader
+  cancel-in-progress: false
+
 jobs:
   download_and_sync:
     runs-on: ubuntu-latest
