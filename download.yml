@@ -1,6 +1,5 @@
 name: Cloud Movie Downloader
 
-# This allows Cloudflare to trigger this action directly via an API request
 on:
   workflow_dispatch:
     inputs:
@@ -13,7 +12,7 @@ jobs:
   download_and_sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Needed to commit the updated movies.json back to your repo
+      contents: write
 
     steps:
       - name: Checkout Repository
