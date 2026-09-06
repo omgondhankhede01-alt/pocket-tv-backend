@@ -23,6 +23,9 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Install Dependencies
         run: |
           pip install telethon google-api-python-client google-auth-httplib2 google-auth-oauthlib
