@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       movie_name:
-        description: 'Name of the movie to download'
+        description: 'Name of the movie(s) to download'
         required: true
         type: string
 
