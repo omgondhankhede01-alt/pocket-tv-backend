@@ -100,8 +100,7 @@ def sync_movies_json():
         json.dump(movie_data, f, indent=4)
     print("[*] movies.json synced successfully.")
 
-def decode_base64_url(encoded_str):
-    """Helper to safely decode base64 URL strings with padding checks"""
+def decode_base64_string(encoded_str):
     try:
         encoded_str += "=" * ((-len(encoded_str)) % 4)
         return base64.b64decode(encoded_str).decode('utf-8')
@@ -109,29 +108,26 @@ def decode_base64_url(encoded_str):
         return None
 
 def resolve_gateway_url(url):
-    """Recursively resolves multi-layered gateway redirects (sec_route & animesuki target parameters)"""
+    """Properly unwraps AnimaHD sec_route and animesuki target base64 parameters"""
     current_url = url
-    for _ in range(3):  # Max 3 redirect layers
+    for _ in range(3):
         parsed = urlparse(current_url)
         query_params = parse_qs(parsed.query)
         
-        # Layer 1: AnimaHD sec_route base64 wrapper (p=)
-        if "sec_route=1" in current_url and "p=" in query_params:
-            decoded = decode_base64_url(query_params["p"][0])
+        if "p=" in query_params:
+            decoded = decode_base64_string(query_params["p"][0])
             if decoded:
-                print(f"[+] Bypassed Layer 1 (sec_route): {decoded}")
+                print(f"[+] Decoded sec_route wrapper: {decoded}")
                 current_url = decoded
                 continue
                 
-        # Layer 2: Animesuki gateway target wrapper (target=)
         if "target=" in query_params:
-            decoded = decode_base64_url(query_params["target"][0])
+            decoded = decode_base64_string(query_params["target"][0])
             if decoded:
-                print(f"[+] Bypassed Layer 2 (target gateway): {decoded}")
+                print(f"[+] Decoded target gateway wrapper: {decoded}")
                 current_url = decoded
                 continue
         break
-        
     return current_url
 
 # --- SOURCE 1: FILMYZILLA SCRAPER ---
@@ -150,7 +146,7 @@ def try_filmyzilla_scrape(query):
         if r.status_code != 200:
             return None
     except Exception as e:
-        print(f"[-] Filmyzilla search error: {e}")
+        print(f"[-] Filmyzilla error: {e}")
         return None
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -165,10 +161,8 @@ def try_filmyzilla_scrape(query):
             score = 0
             if clean_base in c_title:
                 score += 10
-            if season_match:
-                s_token = f"s{int(season_match.group(1)):02d}"
-                if s_token in c_title:
-                    score += 20
+            if season_match and f"s{int(season_match.group(1)):02d}" in c_title:
+                score += 20
             if score > 0:
                 candidates.append((score, title, urljoin(FILMYZILLA_DOMAIN, href)))
 
@@ -218,14 +212,14 @@ def try_filmyzilla_scrape(query):
                         f.write(chunk)
             return local_dl
     except Exception as e:
-        print(f"[-] Error downloading from Filmyzilla stream: {e}")
+        print(f"[-] Filmyzilla download error: {e}")
         return None
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (DEEP MULTI-LAYER GATEWAY BYPASS) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (DECODER BYPASS) ---
 def try_animahd_scrape(query):
-    print(f"\n[Source 2] Searching AnimaHD for series base: '{query}'...")
+    print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
     session.headers.update(HEADERS)
     
@@ -244,10 +238,8 @@ def try_animahd_scrape(query):
         
         anime_page_url = None
         for a in soup.find_all("a", href=True):
-            link_text = clean_text(a.get_text())
-            href = a['href']
-            if clean_text(base_title) in link_text and ANIMAHD_DOMAIN in href:
-                anime_page_url = href
+            if clean_text(base_title) in clean_text(a.get()) and ANIMAHD_DOMAIN in a['href']:
+                anime_page_url = a['href']
                 break
                 
         if not anime_page_url:
@@ -257,12 +249,12 @@ def try_animahd_scrape(query):
                     break
                 
         if not anime_page_url:
-            print("[-] No matching series page found on AnimaHD.")
+            print("[-] Series page not found on AnimaHD.")
             return None
 
         print(f"[*] Found Series Page: {anime_page_url}")
         r2 = session.get(anime_page_url, timeout=12)
-        soup2 = BeautifulSoup2 = BeautifulSoup(r2.text, "html.parser")
+        soup2 = BeautifulSoup(r2.text, "html.parser")
         
         episode_links = []
         for a in soup2.find_all("a", href=True):
@@ -277,28 +269,25 @@ def try_animahd_scrape(query):
             for text, link in episode_links:
                 if re.search(rf'\b(ep|episode|e)\s*0?{ep_num}\b', text, re.IGNORECASE) or re.search(rf'e0?{ep_num}\b', link, re.IGNORECASE):
                     target_ep_link = link
-                    print(f"[+] Matched Episode Link [{text}]: {link}")
                     break
                     
         if not target_ep_link and episode_links:
             target_ep_link = episode_links[0][1]
             
         if not target_ep_link:
-            print("[-] Could not find episode link on series page.")
+            print("[-] Episode link not found.")
             return None
             
-        # Fully unmask the multi-layer gateway wrapper URL (AnimaHD -> Animesuki -> Destination Host)
-        resolved_destination_page = resolve_gateway_url(target_ep_link)
-        
-        # Append passed=1 parameter to fully satisfy destination requirements
-        if "?" in resolved_destination_page:
-            resolved_destination_page += "&passed=1"
+        # Decode base64 gateway to reach actual destination player
+        resolved_page = resolve_gateway_url(target_ep_link)
+        if "?" in resolved_page:
+            resolved_page += "&passed=1"
         else:
-            resolved_destination_page += "?passed=1"
+            resolved_page += "?passed=1"
             
-        print(f"[*] Visiting Unmasked Destination Page: {resolved_destination_page}")
+        print(f"[*] Final Target Destination: {resolved_page}")
         
-        r3 = session.get(resolved_destination_page, timeout=15, allow_redirects=True)
+        r3 = session.get(resolved_page, timeout=15, allow_redirects=True)
         soup3 = BeautifulSoup(r3.text, "html.parser")
         
         download_url = None
@@ -310,10 +299,10 @@ def try_animahd_scrape(query):
                 break
                 
         if not download_url:
-            print("[-] Could not locate final download button link on destination.")
+            print("[-] Download button not located on destination page.")
             return None
             
-        print(f"[+] Downloading media file from: {download_url}")
+        print(f"[+] Downloading file from: {download_url}")
         local_dl = "temp_animahd_stream.mkv"
         session.headers.update({"Referer": r3.url})
         with session.get(download_url, stream=True, allow_redirects=True, timeout=20) as res:
@@ -326,7 +315,7 @@ def try_animahd_scrape(query):
         return local_dl
 
     except Exception as e:
-        print(f"[-] Error scraping AnimaHD: {e}")
+        print(f"[-] AnimaHD scraper error: {e}")
         return None
 
 # --- SOURCE 3: TELEGRAM BOTS FALLBACK ---
@@ -339,7 +328,7 @@ async def try_telegram_bots(query):
         try:
             sent_msg = await client.send_message(bot, query)
             out_id = sent_msg.id
-        except Exception as e:
+        except Exception:
             continue
 
         start_time = time.time()
