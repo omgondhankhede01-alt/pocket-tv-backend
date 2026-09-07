@@ -16,8 +16,8 @@ MOVIE_NAME = os.environ.get("MOVIE_NAME", "").strip()
 
 # Keep ONLY the 2 working bots here
 ACTIVE_BOTS = [
-    "@SLK_MoviesBot",     # Replace with your first verified bot
-    "@SLK_Movies_Bot"      # Replace with your second verified bot
+    "@kevinhartrobot",     # Replace with your first verified bot
+    "@iPapkornA2bot"      # Replace with your second verified bot
 ]
 
 BOT_RESPONSE_TIMEOUT = 45  # Seconds to wait for a bot reply before skipping
