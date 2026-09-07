@@ -6,7 +6,6 @@ import time
 import asyncio
 import subprocess
 import requests
-import urllib.parse
 import unicodedata
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote
@@ -199,9 +198,101 @@ def try_filmyzilla_scrape(query):
 
     return None
 
-# --- SOURCE 2: TELEGRAM BOTS FALLBACK ---
+# --- SOURCE 2: ANIMAHd SCRAPER ---
+def try_animahd_scrape(query):
+    print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
+    episode_match = re.search(r'\bE(\d{1,2})\b', query, re.IGNORECASE)
+    base_title = re.sub(r'\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
+    
+    search_url = f"https://animahd.com/?s={quote(base_title)}"
+    
+    try:
+        r = session.get(search_url, timeout=12)
+        if r.status_code != 200: return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        search_results = soup.find_all("a", href=True)
+        anime_page_url = None
+        for a in search_results:
+            if clean_text(base_title) in clean_text(a.text):
+                anime_page_url = a['href']
+                break
+                
+        if not anime_page_url:
+            print("[-] No matching titles found on AnimaHD.")
+            return None
+
+        print(f"[*] Found Anime Page: {anime_page_url}")
+        r2 = session.get(anime_page_url, timeout=12)
+        soup2 = BeautifulSoup(r2.text, "html.parser")
+        
+        episode_links = []
+        for a in soup2.find_all("a", href=True):
+            text = a.get_text(strip=True)
+            if "S0" in text or "E0" in text or "Episode" in text or ".mkv" in text:
+                episode_links.append((text, a['href']))
+                
+        if not episode_links:
+            print("[-] Could not find episode links on the page.")
+            return None
+
+        target_ep_link = episode_links[0][1] 
+        if episode_match:
+            ep_str = f"E{int(episode_match.group(1)):02d}"
+            for text, link in episode_links:
+                if ep_str in text:
+                    target_ep_link = link
+                    break
+        
+        print(f"[*] Extracting video from Episode Page: {target_ep_link}")
+        
+        r3 = session.get(target_ep_link, timeout=12)
+        soup3 = BeautifulSoup(r3.text, "html.parser")
+        
+        # Smart Extractor: Looks for direct downloads, iframes, and video tags
+        video_stream_url = None 
+        
+        for a in soup3.find_all("a", href=True):
+            if ".mkv" in a['href'] or ".mp4" in a['href']:
+                video_stream_url = a['href']
+                break
+                
+        if not video_stream_url:
+            iframe = soup3.find("iframe")
+            if iframe and 'src' in iframe.attrs:
+                video_stream_url = iframe['src']
+                
+        if not video_stream_url:
+            video_tag = soup3.find("video")
+            if video_tag and 'src' in video_tag.attrs:
+                video_stream_url = video_tag['src']
+                
+        if not video_stream_url:
+            print("[-] Could not extract the raw video stream from the host.")
+            return None
+            
+        print(f"[+] Direct media stream resolved: {video_stream_url}")
+        
+        local_dl = "temp_animahd_stream.mkv"
+        with session.get(video_stream_url, stream=True, timeout=15) as res:
+            res.raise_for_status()
+            with open(local_dl, "wb") as f:
+                for chunk in res.iter_content(chunk_size=1024*1024):
+                    if chunk:
+                        f.write(chunk)
+                        
+        return local_dl
+
+    except Exception as e:
+        print(f"[-] Error scraping AnimaHD: {e}")
+        return None
+
+# --- SOURCE 3: TELEGRAM BOTS FALLBACK ---
 async def try_telegram_bots(query):
-    print(f"\n[Source 2] Falling back to Telegram bots for: '{query}'...")
+    print(f"\n[Source 3] Falling back to Telegram bots for: '{query}'...")
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.connect()
 
@@ -235,52 +326,6 @@ async def try_telegram_bots(query):
 
     await client.disconnect()
     return None
-
-# --- SOURCE 3: INTERNET ARCHIVE FALLBACK ---
-def try_internet_archive(query):
-    print(f"\n[Source 3] Searching Internet Archive for: '{query}'...")
-    clean_query = urllib.parse.quote(query)
-    search_url = f"https://archive.org/advancedsearch.php?q={clean_query}+AND+mediatype:movies&fl[]=identifier,title&output=json&rows=5"
-    
-    try:
-        response = requests.get(search_url, timeout=15)
-        data = response.json()
-        
-        if data['response']['numFound'] == 0:
-            print("[-] No results found on Internet Archive.")
-            return None
-            
-        best_match_id = data['response']['docs'][0]['identifier']
-        print(f"[*] Found match on Archive.org: {best_match_id}")
-        
-        files_url = f"https://archive.org/metadata/{best_match_id}"
-        files_res = requests.get(files_url).json()
-        
-        target_file = None
-        for file in files_res.get('files', []):
-            if file['name'].endswith('.mp4'):
-                target_file = file['name']
-                break
-                
-        if not target_file:
-            print("[-] No MP4 format found for this archive.")
-            return None
-            
-        download_url = f"https://archive.org/download/{best_match_id}/{urllib.parse.quote(target_file)}"
-        print(f"[+] Direct link found: {download_url}")
-        
-        local_dl = "temp_archive_movie.mp4"
-        with requests.get(download_url, stream=True) as r:
-            r.raise_for_status()
-            with open(local_dl, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192): 
-                    f.write(chunk)
-                    
-        return local_dl
-
-    except Exception as e:
-        print(f"[-] Internet Archive search failed: {e}")
-        return None
 
 # --- ENSURE COMPATIBLE H.264/AAC FOR TV PICTURE ---
 def transcode_and_upload(source_file, title_label):
@@ -341,14 +386,18 @@ async def main():
         print("[-] Missing MOVIE_NAME parameter.")
         sys.exit(1)
 
+    # 1. Try Filmyzilla First
     downloaded = try_filmyzilla_scrape(MOVIE_NAME)
 
+    # 2. Try AnimaHD
+    if not downloaded:
+        downloaded = try_animahd_scrape(MOVIE_NAME)
+
+    # 3. Try Telegram Bots
     if not downloaded:
         downloaded = await try_telegram_bots(MOVIE_NAME)
 
-    if not downloaded:
-        downloaded = try_internet_archive(MOVIE_NAME)
-
+    # Process and Upload
     if downloaded:
         transcode_and_upload(downloaded, MOVIE_NAME)
         sync_movies_json()
