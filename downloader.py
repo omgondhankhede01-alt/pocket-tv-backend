@@ -108,20 +108,27 @@ def decode_base64_string(encoded_str):
         return None
 
 def resolve_gateway_url(url):
+    """Correctly splits and decodes AnimaHD sec_route & gateway parameters"""
     current_url = url
     for _ in range(3):
         parsed = urlparse(current_url)
         query_params = parse_qs(parsed.query)
         
-        if "p=" in query_params:
-            decoded = decode_base64_string(query_params["p"][0])
-            if decoded:
-                current_url = decoded
-                continue
+        if "sec_route=1" in current_url and "p=" in current_url:
+            try:
+                p_part = current_url.split("p=")[1].split("&")[0]
+                decoded = decode_base64_string(p_part)
+                if decoded:
+                    print(f"[+] Successfully decoded gateway wrapper -> {decoded}")
+                    current_url = decoded
+                    continue
+            except Exception as e:
+                print(f"[-] Gateway split error: {e}")
                 
         if "target=" in query_params:
             decoded = decode_base64_string(query_params["target"][0])
             if decoded:
+                print(f"[+] Successfully decoded target gateway -> {decoded}")
                 current_url = decoded
                 continue
         break
@@ -214,7 +221,7 @@ def try_filmyzilla_scrape(query):
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (FIXED SYNTAX) ---
+# --- SOURCE 2: ANIMAHd SCRAPER ---
 def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
