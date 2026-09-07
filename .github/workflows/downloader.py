@@ -198,7 +198,7 @@ def try_filmyzilla_scrape(query):
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER ---
+# --- SOURCE 2: ANIMAHd SCRAPER (FIXED REDIRECT RESOLVER) ---
 def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -247,44 +247,38 @@ def try_animahd_scrape(query):
                     target_ep_link = link
                     break
         
-        print(f"[*] Extracting video from Episode Page: {target_ep_link}")
+        print(f"[*] Checking Episode Page for Download Buttons: {target_ep_link}")
         
         r3 = session.get(target_ep_link, timeout=12)
         soup3 = BeautifulSoup(r3.text, "html.parser")
         
-        # Smart Extractor: Looks for direct downloads, iframes, and video tags
-        video_stream_url = None 
-        
+        # Hunt specifically for the Download or Alternate Player buttons and follow redirects
+        download_target_url = None
         for a in soup3.find_all("a", href=True):
-            if ".mkv" in a['href'] or ".mp4" in a['href']:
-                video_stream_url = a['href']
+            button_text = a.get_text(strip=True).lower()
+            if "download episode" in button_text or "alternate player" in button_text or "download" in button_text:
+                raw_href = a['href']
+                download_target_url = urljoin(target_ep_link, raw_href)
                 break
                 
-        if not video_stream_url:
-            iframe = soup3.find("iframe")
-            if iframe and 'src' in iframe.attrs:
-                video_stream_url = iframe['src']
-                
-        if not video_stream_url:
-            video_tag = soup3.find("video")
-            if video_tag and 'src' in video_tag.attrs:
-                video_stream_url = video_tag['src']
-                
-        if not video_stream_url:
-            print("[-] Could not extract the raw video stream from the host.")
+        if not download_target_url:
+            print("[-] Could not locate download button on AnimaHD.")
             return None
             
-        print(f"[+] Direct media stream resolved: {video_stream_url}")
+        print(f"[+] Following redirect link: {download_target_url}")
         
-        local_dl = "temp_animahd_stream.mkv"
-        with session.get(video_stream_url, stream=True, timeout=15) as res:
-            res.raise_for_status()
+        # Follow the redirect to get the ultimate media file stream
+        res = session.get(download_target_url, stream=True, allow_redirects=True, timeout=15)
+        if res.status_code == 200:
+            print(f"[+] Direct media stream resolved: {res.url}")
+            local_dl = "temp_animahd_stream.mkv"
             with open(local_dl, "wb") as f:
                 for chunk in res.iter_content(chunk_size=1024*1024):
                     if chunk:
                         f.write(chunk)
-                        
-        return local_dl
+            return local_dl
+
+        return None
 
     except Exception as e:
         print(f"[-] Error scraping AnimaHD: {e}")
