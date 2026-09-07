@@ -26,7 +26,9 @@ ACTIVE_BOTS = [
     "@iPapkornA2bot"
 ]
 
-BASE_DOMAIN = "https://www.filmyzilla65.com"
+FILMYZILLA_DOMAIN = "https://www.filmyzilla65.com"
+ANIMAHD_DOMAIN = "https://animahd.com"
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -36,10 +38,6 @@ def clean_text(text):
     return re.sub(r'[^a-zA-Z0-9\s]', '', text).lower().strip()
 
 def sanitize_title(title):
-    """
-    1. Converts accented characters (e.g. Pokémon -> Pokemon)
-    2. Standardizes TV episodes into 'Series Name S01E01' format
-    """
     clean = unicodedata.normalize('NFKD', title).encode('ascii', 'ignore').decode('utf-8')
     
     se_match = re.search(r'\b(?:s|season)\s*(\d{1,2})\s*(?:e|ep|episode)\s*(\d{1,2})\b', clean, re.IGNORECASE)
@@ -112,7 +110,7 @@ def try_filmyzilla_scrape(query):
     episode_match = re.search(r'\bE(\d{1,2})\b', query, re.IGNORECASE)
     base_title = re.sub(r'\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
     
-    search_url = f"{BASE_DOMAIN}/search/{quote(base_title)}.html"
+    search_url = f"{FILMYZILLA_DOMAIN}/search/{quote(base_title)}.html"
     try:
         r = session.get(search_url, timeout=12)
         if r.status_code != 200:
@@ -138,7 +136,7 @@ def try_filmyzilla_scrape(query):
                 if s_token in c_title:
                     score += 20
             if score > 0:
-                candidates.append((score, title, urljoin(BASE_DOMAIN, href)))
+                candidates.append((score, title, urljoin(FILMYZILLA_DOMAIN, href)))
 
     if not candidates:
         print("[-] No matching titles found on Filmyzilla.")
@@ -155,7 +153,7 @@ def try_filmyzilla_scrape(query):
             href = a['href']
             text = a.get_text(strip=True)
             if "/server/" in href:
-                tier_candidates.append((text, urljoin(BASE_DOMAIN, href)))
+                tier_candidates.append((text, urljoin(FILMYZILLA_DOMAIN, href)))
 
         if not tier_candidates:
             return None
@@ -177,7 +175,7 @@ def try_filmyzilla_scrape(query):
         session.headers.update({"Referer": target_page})
         r3 = session.get(selected_tier[1], timeout=12)
         soup3 = BeautifulSoup(r3.text, "html.parser")
-        server_links = [urljoin(BASE_DOMAIN, a['href']) for a in soup3.find_all("a", href=True) if "/verified/" in a['href']]
+        server_links = [urljoin(FILMYZILLA_DOMAIN, a['href']) for a in soup3.find_all("a", href=True) if "/verified/" in a['href']]
         
         if not server_links:
             return None
@@ -198,7 +196,7 @@ def try_filmyzilla_scrape(query):
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (DEEP LINK HUNTER) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (AUTOMATED GATEWAY SOLVER) ---
 def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -207,7 +205,7 @@ def try_animahd_scrape(query):
     episode_match = re.search(r'\bE(\d{1,2})\b', query, re.IGNORECASE)
     base_title = re.sub(r'\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
     
-    search_url = f"https://animahd.com/?s={quote(base_title)}"
+    search_url = f"{ANIMAHD_DOMAIN}/?s={quote(base_title)}"
     
     try:
         r = session.get(search_url, timeout=12)
@@ -225,68 +223,57 @@ def try_animahd_scrape(query):
             print("[-] No matching titles found on AnimaHD search.")
             return None
 
-        print(f"[*] Found Anime Page: {anime_page_url}")
+        print(f"[*] Found Series Page: {anime_page_url}")
         r2 = session.get(anime_page_url, timeout=12)
         soup2 = BeautifulSoup(r2.text, "html.parser")
         
-        episode_links = []
+        target_ep_link = None
         for a in soup2.find_all("a", href=True):
             text = a.get_text(strip=True)
             href = a['href']
-            if any(k in text.lower() for k in ["s0", "e0", "episode", "ep"]) or ".mkv" in href or ".mp4" in href:
-                episode_links.append((text, href))
-                
-        if not episode_links:
-            print("[-] Could not find episode links on the anime page.")
-            return None
-
-        target_ep_link = episode_links[0][1] 
-        if episode_match:
-            ep_num = int(episode_match.group(1))
-            ep_pattern = re.compile(rf'\b(ep|episode|e)[-_\s]*0?{ep_num}\b', re.IGNORECASE)
-            for text, link in episode_links:
-                if ep_pattern.search(text) or f"ep {ep_num}" in text.lower():
-                    target_ep_link = link
+            if episode_match:
+                ep_num = int(episode_match.group(1))
+                ep_pattern = re.compile(rf's\d+e0?{ep_num}\b', re.IGNORECASE)
+                if ep_pattern.search(text) or ep_pattern.search(href) or f"e{ep_num:02d}" in text.lower():
+                    target_ep_link = urljoin(ANIMAHD_DOMAIN, href)
                     break
-        
-        print(f"[*] Scanning Episode Page links: {target_ep_link}")
-        
-        r3 = session.get(target_ep_link, timeout=12)
-        soup3 = BeautifulSoup(r3.text, "html.parser")
-        
-        # Collect all anchor links on the episode page for deep inspection
-        all_links = [(a.get_text(strip=True), a['href']) for a in soup3.find_all("a", href=True)]
-        
-        video_stream_url = None
-        for text, href in all_links:
-            t_lower = text.lower()
-            h_lower = href.lower()
-            if "download" in t_lower or "drive.google.com" in h_lower or ".mkv" in h_lower or ".mp4" in h_lower or "server" in t_lower or "player" in t_lower:
-                if href.startswith("http"):
-                    video_stream_url = href
-                    print(f"[+] Matched stream link via '{text}': {href}")
-                    break
-                elif "drive.google.com" in h_lower or "file" in h_lower:
-                    video_stream_url = urljoin(target_ep_link, href)
-                    print(f"[+] Matched relative link via '{text}': {video_stream_url}")
-                    break
+            else:
+                target_ep_link = urljoin(ANIMAHD_DOMAIN, href)
+                break
                 
-        if not video_stream_url:
-            iframe = soup3.find("iframe")
-            if iframe and 'src' in iframe.attrs:
-                video_stream_url = iframe['src']
-                print(f"[+] Found iframe stream source: {video_stream_url}")
-                
-        if not video_stream_url:
-            print("[-] Diagnostic - Could not match a download link. Here are all links found on the episode page:")
-            for text, href in all_links[:20]:
-                print(f"    - Text: '{text}' | Href: '{href}'")
+        if not target_ep_link:
+            print("[-] Could not find episode link on AnimaHD page.")
             return None
             
-        print(f"[+] Downloading media stream from: {video_stream_url}")
+        print(f"[*] Resolving Gateway Route: {target_ep_link}")
+        r3 = session.get(target_ep_link, timeout=12, allow_redirects=True)
         
+        # Automatically pass the verification flag if hit with a gate redirect
+        if "?gate=" in r3.url or "passed=1" not in r3.url:
+            gate_bypass_url = r3.url + ("&" if "?" in r3.url else "?") + "passed=1"
+            print(f"[*] Applying Gateway Bypass Token: {gate_bypass_url}")
+            r3 = session.get(gate_bypass_url, timeout=12, allow_redirects=True)
+
+        soup3 = BeautifulSoup(r3.text, "html.parser")
+        
+        # Locate the final download button endpoint (e.g. https://youranimewatchingplace.animahd.fun/?eid=MjA0ZTdiMjMyMzQ4N2QyOTQwNDk1YTQzNjQyMDdiNWY2MzY0Nzc1MjI4NDAyODRlNGIzYzdlNzk3OTQwN2M0YjY5&passed=1# or direct media link)
+        download_url = None
+        for a in soup3.find_all("a", href=True):
+            text = a.get_text(strip=True).lower()
+            href = a['href']
+            if "download" in text or "url?id=" in href or ".mkv" in href or ".mp4" in href:
+                download_url = urljoin(r3.url, href)
+                print(f"[+] Final media download link resolved: {download_url}")
+                break
+                
+        if not download_url:
+            print("[-] Could not locate final download button link on destination.")
+            return None
+            
+        print(f"[+] Streaming and downloading media file...")
         local_dl = "temp_animahd_stream.mkv"
-        with session.get(video_stream_url, stream=True, allow_redirects=True, timeout=15) as res:
+        session.headers.update({"Referer": r3.url})
+        with session.get(download_url, stream=True, allow_redirects=True, timeout=20) as res:
             res.raise_for_status()
             with open(local_dl, "wb") as f:
                 for chunk in res.iter_content(chunk_size=1024*1024):
