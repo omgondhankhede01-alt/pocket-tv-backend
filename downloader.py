@@ -108,7 +108,6 @@ def decode_base64_string(encoded_str):
         return None
 
 def resolve_gateway_url(url):
-    """Properly unwraps AnimaHD sec_route and animesuki target base64 parameters"""
     current_url = url
     for _ in range(3):
         parsed = urlparse(current_url)
@@ -117,14 +116,12 @@ def resolve_gateway_url(url):
         if "p=" in query_params:
             decoded = decode_base64_string(query_params["p"][0])
             if decoded:
-                print(f"[+] Decoded sec_route wrapper: {decoded}")
                 current_url = decoded
                 continue
                 
         if "target=" in query_params:
             decoded = decode_base64_string(query_params["target"][0])
             if decoded:
-                print(f"[+] Decoded target gateway wrapper: {decoded}")
                 current_url = decoded
                 continue
         break
@@ -217,7 +214,7 @@ def try_filmyzilla_scrape(query):
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (DECODER BYPASS) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (FIXED SYNTAX) ---
 def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -238,7 +235,7 @@ def try_animahd_scrape(query):
         
         anime_page_url = None
         for a in soup.find_all("a", href=True):
-            if clean_text(base_title) in clean_text(a.get()) and ANIMAHD_DOMAIN in a['href']:
+            if clean_text(base_title) in clean_text(a.get_text()) and ANIMAHD_DOMAIN in a['href']:
                 anime_page_url = a['href']
                 break
                 
@@ -278,7 +275,6 @@ def try_animahd_scrape(query):
             print("[-] Episode link not found.")
             return None
             
-        # Decode base64 gateway to reach actual destination player
         resolved_page = resolve_gateway_url(target_ep_link)
         if "?" in resolved_page:
             resolved_page += "&passed=1"
