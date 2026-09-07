@@ -6,6 +6,7 @@ import time
 import asyncio
 import subprocess
 import requests
+import base64
 import unicodedata
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote
@@ -20,7 +21,6 @@ API_HASH = "198b328ce18f36d0ee8e69f1256d7a16"
 SESSION_STRING = os.environ.get("TG_SESSION", "")
 MOVIE_NAME = os.environ.get("MOVIE_NAME", "").strip()
 
-# Verified bots
 ACTIVE_BOTS = [
     "@kevinhartrobot",
     "@iPapkornA2bot"
@@ -100,6 +100,21 @@ def sync_movies_json():
         json.dump(movie_data, f, indent=4)
     print("[*] movies.json synced successfully.")
 
+def resolve_gateway_url(url):
+    """Decodes AnimaHD ?sec_route=1&p= BASE64 gateway links instantly"""
+    if "sec_route=1" in url and "p=" in url:
+        try:
+            p_param = url.split("p=")[1].split("&")[0]
+            # Add padding if missing
+            p_param += "=" *((-len(p_param)) % 4)
+            decoded_bytes = base64.b64decode(p_param)
+            real_url = decoded_bytes.decode('utf-8')
+            print(f"[+] Gateway Bypassed -> Resolved Real URL: {real_url}")
+            return real_url
+        except Exception as e:
+            print(f"[-] Gateway decode error: {e}")
+    return url
+
 # --- SOURCE 1: FILMYZILLA SCRAPER ---
 def try_filmyzilla_scrape(query):
     print(f"\n[Source 1] Searching Filmyzilla for: '{query}'...")
@@ -139,7 +154,6 @@ def try_filmyzilla_scrape(query):
                 candidates.append((score, title, urljoin(FILMYZILLA_DOMAIN, href)))
 
     if not candidates:
-        print("[-] No matching titles found on Filmyzilla.")
         return None
 
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -166,11 +180,6 @@ def try_filmyzilla_scrape(query):
                 if ep_pattern.search(text) or f"ep {ep_num}" in text.lower():
                     selected_tier = (text, link)
                     break
-        else:
-            for text, link in tier_candidates:
-                if "720p" in text.lower():
-                    selected_tier = (text, link)
-                    break
 
         session.headers.update({"Referer": target_page})
         r3 = session.get(selected_tier[1], timeout=12)
@@ -183,7 +192,6 @@ def try_filmyzilla_scrape(query):
         session.headers.update({"Referer": selected_tier[1]})
         res = session.get(server_links[0], stream=True, allow_redirects=True, timeout=15)
         if res.status_code == 200:
-            print(f"[+] Direct media stream resolved: {res.url}")
             local_dl = "temp_raw_stream.mkv"
             with open(local_dl, "wb") as f:
                 for chunk in res.iter_content(chunk_size=1024*1024):
@@ -196,29 +204,25 @@ def try_filmyzilla_scrape(query):
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (CLEAN BASE SEARCH -> EPISODE PARSER) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (BASE64 GATEWAY BYPASS) ---
 def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for series base: '{query}'...")
     session = requests.Session()
     session.headers.update(HEADERS)
     
-    # Extract episode number if present
     episode_match = re.search(r'\b(?:e|ep|episode)\s*(\d{1,2})\b', query, re.IGNORECASE)
     if not episode_match:
         episode_match = re.search(r'\bs\d{1,2}e(\d{1,2})\b', query, re.IGNORECASE)
     
-    # Strip out S01E01 / Season tokens so the site gets a clean series title search
     base_title = re.sub(r'\b(?:s|season)\s*\d{1,2}\s*(?:e|ep|episode)\s*\d{1,2}\b|\b(?:e|ep|episode)\s*\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
     
     search_url = f"{ANIMAHD_DOMAIN}/?s={quote(base_title)}"
-    print(f"[*] Query URL: {search_url}")
     
     try:
         r = session.get(search_url, timeout=12)
         if r.status_code != 200: return None
         soup = BeautifulSoup(r.text, "html.parser")
         
-        # Find the series page link
         anime_page_url = None
         for a in soup.find_all("a", href=True):
             link_text = clean_text(a.get_text())
@@ -228,7 +232,6 @@ def try_animahd_scrape(query):
                 break
                 
         if not anime_page_url:
-            # Fallback to the first post link in search results
             for a in soup.find_all("a", href=True):
                 if ANIMAHD_DOMAIN in a['href'] and a['href'] != ANIMAHD_DOMAIN + "/":
                     anime_page_url = a['href']
@@ -242,7 +245,6 @@ def try_animahd_scrape(query):
         r2 = session.get(anime_page_url, timeout=12)
         soup2 = BeautifulSoup(r2.text, "html.parser")
         
-        # Parse all available episode links on the series page
         episode_links = []
         for a in soup2.find_all("a", href=True):
             text = a.get_text(strip=True)
@@ -253,30 +255,24 @@ def try_animahd_scrape(query):
         target_ep_link = None
         if episode_match and episode_links:
             ep_num = int(episode_match.group(1))
-            print(f"[*] Looking for Episode {ep_num:02d} among {len(episode_links)} links...")
             for text, link in episode_links:
                 if re.search(rf'\b(ep|episode|e)\s*0?{ep_num}\b', text, re.IGNORECASE) or re.search(rf'e0?{ep_num}\b', link, re.IGNORECASE):
                     target_ep_link = link
                     print(f"[+] Matched Episode Link [{text}]: {link}")
                     break
                     
-        # Fallback if specific episode wasn't explicitly matched
         if not target_ep_link and episode_links:
             target_ep_link = episode_links[0][1]
-            print(f"[*] Defaulting to first link found: {target_ep_link}")
             
         if not target_ep_link:
             print("[-] Could not find episode link on series page.")
             return None
             
-        print(f"[*] Visiting Episode Page: {target_ep_link}")
-        r3 = session.get(target_ep_link, timeout=12, allow_redirects=True)
+        # Unmask the gateway wrapper URL immediately
+        resolved_ep_page = resolve_gateway_url(target_ep_link)
+        print(f"[*] Visiting Real Episode Player Page: {resolved_ep_page}")
         
-        # Bypass gateway token check if redirected
-        if "?gate=" in r3.url or "passed=1" not in r3.url:
-            gate_bypass_url = r3.url + ("&" if "?" in r3.url else "?") + "passed=1"
-            r3 = session.get(gate_bypass_url, timeout=12, allow_redirects=True)
-
+        r3 = session.get(resolved_ep_page, timeout=12, allow_redirects=True)
         soup3 = BeautifulSoup(r3.text, "html.parser")
         
         download_url = None
@@ -291,7 +287,7 @@ def try_animahd_scrape(query):
             print("[-] Could not locate final download button link.")
             return None
             
-        print(f"[+] Downloading media file...")
+        print(f"[+] Downloading media file from: {download_url}")
         local_dl = "temp_animahd_stream.mkv"
         session.headers.update({"Referer": r3.url})
         with session.get(download_url, stream=True, allow_redirects=True, timeout=20) as res:
@@ -314,12 +310,10 @@ async def try_telegram_bots(query):
     await client.connect()
 
     for bot in ACTIVE_BOTS:
-        print(f"[*] Querying bot: {bot}...")
         try:
             sent_msg = await client.send_message(bot, query)
             out_id = sent_msg.id
         except Exception as e:
-            print(f"[-] Could not message {bot}: {e}")
             continue
 
         start_time = time.time()
@@ -336,7 +330,6 @@ async def try_telegram_bots(query):
 
         if target_media_msg:
             f_name = getattr(target_media_msg.file, 'name', '') or "video.mp4"
-            print(f"[+] Direct file received from {bot}: {f_name}")
             dl_path = await target_media_msg.download_media(file=f"temp_{f_name}")
             await client.disconnect()
             return dl_path
@@ -344,36 +337,20 @@ async def try_telegram_bots(query):
     await client.disconnect()
     return None
 
-# --- ENSURE COMPATIBLE H.264/AAC FOR TV PICTURE ---
 def transcode_and_upload(source_file, title_label):
     clean_title = sanitize_title(title_label)
     final_output = f"{clean_title}.mp4"
     
-    print(f"\n[*] Standardized Title: {clean_title}")
-    print(f"[*] Verifying TV video compatibility for {source_file}...")
-    
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-i", source_file,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "28",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
         final_output
     ]
     
     proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+    upload_target = final_output if proc.returncode == 0 else source_file
     
-    if proc.returncode == 0:
-        print("[+] TV-Ready Transcode successful!")
-        upload_target = final_output
-    else:
-        print(f"[-] FFMPEG TRANSCODE FAILED! GitHub Actions ran low on resources.")
-        print(f"[-] Error Log: {proc.stderr[-500:]}")
-        print(f"[*] FALLBACK: Uploading raw file to Drive...")
-        upload_target = source_file
-    
-    print(f"[*] Uploading {upload_target} to Google Drive...")
     service = get_drive_service()
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
     metadata = {'name': clean_title + ".mp4", 'parents': [folder_id]}
@@ -381,45 +358,30 @@ def transcode_and_upload(source_file, title_label):
     
     uploaded_file = service.files().create(body=metadata, media_body=media, fields='id').execute()
     file_id = uploaded_file.get('id')
-    print(f"[+] Upload complete. File ID: {file_id}")
     
     try:
-        service.permissions().create(
-            fileId=file_id,
-            body={"type": "anyone", "role": "reader"}
-        ).execute()
-        print("[+] File permissions set to Public.")
-    except Exception as e:
-        print(f"[-] Could not set public permissions: {e}")
+        service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
+    except Exception:
+        pass
     
     for f in [source_file, final_output]:
         if os.path.exists(f):
             os.remove(f)
-            
-    print(f"[✓] Completed workflow for: {clean_title}")
 
 async def main():
     if not MOVIE_NAME:
-        print("[-] Missing MOVIE_NAME parameter.")
         sys.exit(1)
 
-    # 1. Try Filmyzilla First
     downloaded = try_filmyzilla_scrape(MOVIE_NAME)
-
-    # 2. Try AnimaHD
     if not downloaded:
         downloaded = try_animahd_scrape(MOVIE_NAME)
-
-    # 3. Try Telegram Bots
     if not downloaded:
         downloaded = await try_telegram_bots(MOVIE_NAME)
 
-    # Process and Upload
     if downloaded:
         transcode_and_upload(downloaded, MOVIE_NAME)
         sync_movies_json()
     else:
-        print(f"[-] All sources failed to retrieve '{MOVIE_NAME}'.")
         sys.exit(1)
 
 if __name__ == "__main__":
