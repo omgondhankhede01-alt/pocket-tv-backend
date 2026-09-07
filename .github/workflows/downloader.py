@@ -6,6 +6,7 @@ import time
 import asyncio
 import subprocess
 import requests
+import urllib.parse
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote
 from telethon import TelegramClient
@@ -202,6 +203,52 @@ async def try_telegram_bots(query):
     await client.disconnect()
     return None
 
+# --- SOURCE 3: INTERNET ARCHIVE FALLBACK ---
+def try_internet_archive(query):
+    print(f"\n[Source 3] Searching Internet Archive for: '{query}'...")
+    clean_query = urllib.parse.quote(query)
+    search_url = f"https://archive.org/advancedsearch.php?q={clean_query}+AND+mediatype:movies&fl[]=identifier,title&output=json&rows=5"
+    
+    try:
+        response = requests.get(search_url, timeout=15)
+        data = response.json()
+        
+        if data['response']['numFound'] == 0:
+            print("[-] No results found on Internet Archive.")
+            return None
+            
+        best_match_id = data['response']['docs'][0]['identifier']
+        print(f"[*] Found match on Archive.org: {best_match_id}")
+        
+        files_url = f"https://archive.org/metadata/{best_match_id}"
+        files_res = requests.get(files_url).json()
+        
+        target_file = None
+        for file in files_res.get('files', []):
+            if file['name'].endswith('.mp4'):
+                target_file = file['name']
+                break
+                
+        if not target_file:
+            print("[-] No MP4 format found for this archive.")
+            return None
+            
+        download_url = f"https://archive.org/download/{best_match_id}/{urllib.parse.quote(target_file)}"
+        print(f"[+] Direct link found: {download_url}")
+        
+        local_dl = "temp_archive_movie.mp4"
+        with requests.get(download_url, stream=True) as r:
+            r.raise_for_status()
+            with open(local_dl, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192): 
+                    f.write(chunk)
+                    
+        return local_dl
+
+    except Exception as e:
+        print(f"[-] Internet Archive search failed: {e}")
+        return None
+
 # --- ENSURE COMPATIBLE H.264/AAC FOR TV PICTURE ---
 def transcode_and_upload(source_file, title_label):
     safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', title_label)
@@ -220,7 +267,6 @@ def transcode_and_upload(source_file, title_label):
         final_output
     ]
     
-    # Run with capture_output to see exact errors if it fails
     proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
     
     if proc.returncode == 0:
@@ -228,7 +274,7 @@ def transcode_and_upload(source_file, title_label):
         upload_target = final_output
     else:
         print(f"[-] FFMPEG TRANSCODE FAILED! GitHub Actions likely ran out of memory.")
-        print(f"[-] Error Log: {proc.stderr[-500:]}") # Print the last 500 chars of the error
+        print(f"[-] Error Log: {proc.stderr[-500:]}")
         print(f"[*] FALLBACK: Uploading raw incompatible file to Drive...")
         upload_target = source_file
     
@@ -242,7 +288,7 @@ def transcode_and_upload(source_file, title_label):
     file_id = uploaded_file.get('id')
     print(f"[+] Upload complete. File ID: {file_id}")
     
-    # NEW: Automatically set Google Drive file to Public so the TV streams it without 403 errors
+    # Automatically set Google Drive file to Public so the TV streams it without 403 errors
     try:
         service.permissions().create(
             fileId=file_id,
@@ -264,11 +310,18 @@ async def main():
         print("[-] Missing MOVIE_NAME parameter.")
         sys.exit(1)
 
+    # 1. Try Filmyzilla
     downloaded = try_filmyzilla_scrape(MOVIE_NAME)
 
+    # 2. If Filmyzilla fails, try Telegram Bots
     if not downloaded:
         downloaded = await try_telegram_bots(MOVIE_NAME)
 
+    # 3. If Telegram fails, try Internet Archive
+    if not downloaded:
+        downloaded = try_internet_archive(MOVIE_NAME)
+
+    # Process and Upload
     if downloaded:
         transcode_and_upload(downloaded, MOVIE_NAME)
         sync_movies_json()
@@ -277,4 +330,5 @@ async def main():
         sys.exit(1)
 
 if __name__ == "__main__":
+    asyncio.run(main())
     asyncio.run(main())
