@@ -198,7 +198,7 @@ def try_filmyzilla_scrape(query):
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (FIXED REDIRECT RESOLVER) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (DEEP LINK HUNTER) ---
 def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -222,7 +222,7 @@ def try_animahd_scrape(query):
                 break
                 
         if not anime_page_url:
-            print("[-] No matching titles found on AnimaHD.")
+            print("[-] No matching titles found on AnimaHD search.")
             return None
 
         print(f"[*] Found Anime Page: {anime_page_url}")
@@ -232,53 +232,68 @@ def try_animahd_scrape(query):
         episode_links = []
         for a in soup2.find_all("a", href=True):
             text = a.get_text(strip=True)
-            if "S0" in text or "E0" in text or "Episode" in text or ".mkv" in text:
-                episode_links.append((text, a['href']))
+            href = a['href']
+            if any(k in text.lower() for k in ["s0", "e0", "episode", "ep"]) or ".mkv" in href or ".mp4" in href:
+                episode_links.append((text, href))
                 
         if not episode_links:
-            print("[-] Could not find episode links on the page.")
+            print("[-] Could not find episode links on the anime page.")
             return None
 
         target_ep_link = episode_links[0][1] 
         if episode_match:
-            ep_str = f"E{int(episode_match.group(1)):02d}"
+            ep_num = int(episode_match.group(1))
+            ep_pattern = re.compile(rf'\b(ep|episode|e)[-_\s]*0?{ep_num}\b', re.IGNORECASE)
             for text, link in episode_links:
-                if ep_str in text:
+                if ep_pattern.search(text) or f"ep {ep_num}" in text.lower():
                     target_ep_link = link
                     break
         
-        print(f"[*] Checking Episode Page for Download Buttons: {target_ep_link}")
+        print(f"[*] Scanning Episode Page links: {target_ep_link}")
         
         r3 = session.get(target_ep_link, timeout=12)
         soup3 = BeautifulSoup(r3.text, "html.parser")
         
-        # Hunt specifically for the Download or Alternate Player buttons and follow redirects
-        download_target_url = None
-        for a in soup3.find_all("a", href=True):
-            button_text = a.get_text(strip=True).lower()
-            if "download episode" in button_text or "alternate player" in button_text or "download" in button_text:
-                raw_href = a['href']
-                download_target_url = urljoin(target_ep_link, raw_href)
-                break
+        # Collect all anchor links on the episode page for deep inspection
+        all_links = [(a.get_text(strip=True), a['href']) for a in soup3.find_all("a", href=True)]
+        
+        video_stream_url = None
+        for text, href in all_links:
+            t_lower = text.lower()
+            h_lower = href.lower()
+            if "download" in t_lower or "drive.google.com" in h_lower or ".mkv" in h_lower or ".mp4" in h_lower or "server" in t_lower or "player" in t_lower:
+                if href.startswith("http"):
+                    video_stream_url = href
+                    print(f"[+] Matched stream link via '{text}': {href}")
+                    break
+                elif "drive.google.com" in h_lower or "file" in h_lower:
+                    video_stream_url = urljoin(target_ep_link, href)
+                    print(f"[+] Matched relative link via '{text}': {video_stream_url}")
+                    break
                 
-        if not download_target_url:
-            print("[-] Could not locate download button on AnimaHD.")
+        if not video_stream_url:
+            iframe = soup3.find("iframe")
+            if iframe and 'src' in iframe.attrs:
+                video_stream_url = iframe['src']
+                print(f"[+] Found iframe stream source: {video_stream_url}")
+                
+        if not video_stream_url:
+            print("[-] Diagnostic - Could not match a download link. Here are all links found on the episode page:")
+            for text, href in all_links[:20]:
+                print(f"    - Text: '{text}' | Href: '{href}'")
             return None
             
-        print(f"[+] Following redirect link: {download_target_url}")
+        print(f"[+] Downloading media stream from: {video_stream_url}")
         
-        # Follow the redirect to get the ultimate media file stream
-        res = session.get(download_target_url, stream=True, allow_redirects=True, timeout=15)
-        if res.status_code == 200:
-            print(f"[+] Direct media stream resolved: {res.url}")
-            local_dl = "temp_animahd_stream.mkv"
+        local_dl = "temp_animahd_stream.mkv"
+        with session.get(video_stream_url, stream=True, allow_redirects=True, timeout=15) as res:
+            res.raise_for_status()
             with open(local_dl, "wb") as f:
                 for chunk in res.iter_content(chunk_size=1024*1024):
                     if chunk:
                         f.write(chunk)
-            return local_dl
-
-        return None
+                        
+        return local_dl
 
     except Exception as e:
         print(f"[-] Error scraping AnimaHD: {e}")
