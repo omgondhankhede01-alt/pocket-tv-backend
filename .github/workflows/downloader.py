@@ -7,6 +7,7 @@ import asyncio
 import subprocess
 import requests
 import urllib.parse
+import unicodedata
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote
 from telethon import TelegramClient
@@ -20,7 +21,7 @@ API_HASH = "198b328ce18f36d0ee8e69f1256d7a16"
 SESSION_STRING = os.environ.get("TG_SESSION", "")
 MOVIE_NAME = os.environ.get("MOVIE_NAME", "").strip()
 
-# Your 2 verified bots from your workflow
+# Verified bots
 ACTIVE_BOTS = [
     "@kevinhartrobot",
     "@iPapkornA2bot"
@@ -34,6 +35,38 @@ HEADERS = {
 
 def clean_text(text):
     return re.sub(r'[^a-zA-Z0-9\s]', '', text).lower().strip()
+
+def sanitize_title(title):
+    """
+    1. Converts accented characters (e.g. Pokémon -> Pokemon)
+    2. Standardizes TV episodes into 'Series Name S01E01' format
+    """
+    clean = unicodedata.normalize('NFKD', title).encode('ascii', 'ignore').decode('utf-8')
+    
+    se_match = re.search(r'\b(?:s|season)\s*(\d{1,2})\s*(?:e|ep|episode)\s*(\d{1,2})\b', clean, re.IGNORECASE)
+    es_match = re.search(r'\b(?:e|ep|episode)\s*(\d{1,2})\s*(?:s|season)\s*(\d{1,2})\b', clean, re.IGNORECASE)
+    e_match = re.search(r'\b(?:e|ep|episode)\s*(\d{1,2})\b', clean, re.IGNORECASE)
+    
+    if se_match:
+        s_num = int(se_match.group(1))
+        e_num = int(se_match.group(2))
+        base = re.sub(r'\b(?:s|season)\s*\d{1,2}\s*(?:e|ep|episode)\s*\d{1,2}\b', '', clean, flags=re.IGNORECASE).strip()
+        base = re.sub(r'[<>:"/\\|?*]', '', base).strip()
+        return f"{base.title()} S{s_num:02d}E{e_num:02d}"
+    elif es_match:
+        e_num = int(es_match.group(1))
+        s_num = int(es_match.group(2))
+        base = re.sub(r'\b(?:e|ep|episode)\s*\d{1,2}\s*(?:s|season)\s*\d{1,2}\b', '', clean, flags=re.IGNORECASE).strip()
+        base = re.sub(r'[<>:"/\\|?*]', '', base).strip()
+        return f"{base.title()} S{s_num:02d}E{e_num:02d}"
+    elif e_match:
+        e_num = int(e_match.group(1))
+        base = re.sub(r'\b(?:e|ep|episode)\s*\d{1,2}\b', '', clean, flags=re.IGNORECASE).strip()
+        base = re.sub(r'[<>:"/\\|?*]', '', base).strip()
+        return f"{base.title()} S01E{e_num:02d}"
+    else:
+        clean = re.sub(r'[<>:"/\\|?*]', '', clean).strip()
+        return clean.title()
 
 def get_drive_service():
     client_id = os.environ.get("GCP_CLIENT_ID", "")
@@ -251,19 +284,19 @@ def try_internet_archive(query):
 
 # --- ENSURE COMPATIBLE H.264/AAC FOR TV PICTURE ---
 def transcode_and_upload(source_file, title_label):
-    safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', title_label)
-    final_output = f"{safe_title}.mp4"
+    clean_title = sanitize_title(title_label)
+    final_output = f"{clean_title}.mp4"
     
-    print(f"\n[*] Verifying TV video compatibility for {source_file}...")
+    print(f"\n[*] Standardized Title: {clean_title}")
+    print(f"[*] Verifying TV video compatibility for {source_file}...")
     
-    # Highly optimized FFmpeg command to prevent GitHub Actions memory crashes
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-i", source_file,
-        "-c:v", "libx264",           # Force standard H.264 video (The ONLY codec TV browsers like)
-        "-preset", "ultrafast",      # Critical: Stops GitHub Actions from crashing
-        "-crf", "28",                # Critical: Lowered from 24 to 28 to save RAM and disk space
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "28",
         "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",   # Critical: Allows instant web streaming
+        "-movflags", "+faststart",
         final_output
     ]
     
@@ -273,55 +306,49 @@ def transcode_and_upload(source_file, title_label):
         print("[+] TV-Ready Transcode successful!")
         upload_target = final_output
     else:
-        print(f"[-] FFMPEG TRANSCODE FAILED! GitHub Actions likely ran out of memory.")
+        print(f"[-] FFMPEG TRANSCODE FAILED! GitHub Actions ran low on resources.")
         print(f"[-] Error Log: {proc.stderr[-500:]}")
-        print(f"[*] FALLBACK: Uploading raw incompatible file to Drive...")
+        print(f"[*] FALLBACK: Uploading raw file to Drive...")
         upload_target = source_file
     
     print(f"[*] Uploading {upload_target} to Google Drive...")
     service = get_drive_service()
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
-    metadata = {'name': os.path.basename(upload_target), 'parents': [folder_id]}
+    metadata = {'name': clean_title + ".mp4", 'parents': [folder_id]}
     media = MediaFileUpload(upload_target, mimetype='video/mp4', resumable=True)
     
     uploaded_file = service.files().create(body=metadata, media_body=media, fields='id').execute()
     file_id = uploaded_file.get('id')
     print(f"[+] Upload complete. File ID: {file_id}")
     
-    # Automatically set Google Drive file to Public so the TV streams it without 403 errors
     try:
         service.permissions().create(
             fileId=file_id,
             body={"type": "anyone", "role": "reader"}
         ).execute()
-        print("[+] File permissions successfully set to Public.")
+        print("[+] File permissions set to Public.")
     except Exception as e:
         print(f"[-] Could not set public permissions: {e}")
     
-    # Cleanup files to free up GitHub Actions space
     for f in [source_file, final_output]:
         if os.path.exists(f):
             os.remove(f)
             
-    print(f"[✓] Completed workflow for: {title_label}")
+    print(f"[✓] Completed workflow for: {clean_title}")
 
 async def main():
     if not MOVIE_NAME:
         print("[-] Missing MOVIE_NAME parameter.")
         sys.exit(1)
 
-    # 1. Try Filmyzilla
     downloaded = try_filmyzilla_scrape(MOVIE_NAME)
 
-    # 2. If Filmyzilla fails, try Telegram Bots
     if not downloaded:
         downloaded = await try_telegram_bots(MOVIE_NAME)
 
-    # 3. If Telegram fails, try Internet Archive
     if not downloaded:
         downloaded = try_internet_archive(MOVIE_NAME)
 
-    # Process and Upload
     if downloaded:
         transcode_and_upload(downloaded, MOVIE_NAME)
         sync_movies_json()
@@ -330,5 +357,4 @@ async def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    asyncio.run(main())
     asyncio.run(main())
