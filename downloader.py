@@ -114,7 +114,6 @@ def try_filmyzilla_scrape(query):
     candidates.sort(key=lambda x: x[0], reverse=True)
     target_page = candidates[0][2]
     
-    # Check intermediate page
     try:
         r2 = session.get(target_page, timeout=12)
         soup2 = BeautifulSoup(r2.text, "html.parser")
@@ -184,7 +183,6 @@ async def try_telegram_bots(query):
         start_time = time.time()
         target_media_msg = None
 
-        # Ignore older messages to avoid redownloading previous movies
         while time.time() - start_time < 45:
             async for msg in client.iter_messages(bot, min_id=out_id, limit=5):
                 if msg.media or msg.document or msg.video:
@@ -209,31 +207,57 @@ def transcode_and_upload(source_file, title_label):
     safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', title_label)
     final_output = f"{safe_title}.mp4"
     
-    print(f"[*] Verifying TV video compatibility for {source_file}...")
-    # Fast transcode/repackage to H.264/AAC so TV hardware decoder displays both video and audio
+    print(f"\n[*] Verifying TV video compatibility for {source_file}...")
+    
+    # Highly optimized FFmpeg command to prevent GitHub Actions memory crashes
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-i", source_file,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+        "-c:v", "libx264",           # Force standard H.264 video (The ONLY codec TV browsers like)
+        "-preset", "ultrafast",      # Critical: Stops GitHub Actions from crashing
+        "-crf", "28",                # Critical: Lowered from 24 to 28 to save RAM and disk space
         "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
+        "-movflags", "+faststart",   # Critical: Allows instant web streaming
         final_output
     ]
     
-    proc = subprocess.run(ffmpeg_cmd)
-    upload_target = final_output if proc.returncode == 0 else source_file
+    # Run with capture_output to see exact errors if it fails
+    proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+    
+    if proc.returncode == 0:
+        print("[+] TV-Ready Transcode successful!")
+        upload_target = final_output
+    else:
+        print(f"[-] FFMPEG TRANSCODE FAILED! GitHub Actions likely ran out of memory.")
+        print(f"[-] Error Log: {proc.stderr[-500:]}") # Print the last 500 chars of the error
+        print(f"[*] FALLBACK: Uploading raw incompatible file to Drive...")
+        upload_target = source_file
     
     print(f"[*] Uploading {upload_target} to Google Drive...")
     service = get_drive_service()
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
     metadata = {'name': os.path.basename(upload_target), 'parents': [folder_id]}
     media = MediaFileUpload(upload_target, mimetype='video/mp4', resumable=True)
-    service.files().create(body=metadata, media_body=media, fields='id').execute()
     
+    uploaded_file = service.files().create(body=metadata, media_body=media, fields='id').execute()
+    file_id = uploaded_file.get('id')
+    print(f"[+] Upload complete. File ID: {file_id}")
+    
+    # NEW: Automatically set Google Drive file to Public so the TV streams it without 403 errors
+    try:
+        service.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"}
+        ).execute()
+        print("[+] File permissions successfully set to Public.")
+    except Exception as e:
+        print(f"[-] Could not set public permissions: {e}")
+    
+    # Cleanup files to free up GitHub Actions space
     for f in [source_file, final_output]:
         if os.path.exists(f):
             os.remove(f)
             
-    print(f"[✓] Completed and uploaded: {title_label}")
+    print(f"[✓] Completed workflow for: {title_label}")
 
 async def main():
     if not MOVIE_NAME:
