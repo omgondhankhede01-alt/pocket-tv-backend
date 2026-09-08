@@ -9,7 +9,7 @@ import requests
 import base64
 import unicodedata
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, parse_qs, urlparse
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from google.oauth2.credentials import Credentials
@@ -86,7 +86,15 @@ def install_browser_engine():
         subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
         print("[+] Headless browser installed successfully!")
 
-# --- SOURCE 1: FILMYZILLA SCRAPER (FAST STATIC) ---
+def decode_base64_string(encoded_str):
+    try:
+        encoded_str = encoded_str.replace('-', '+').replace('_', '/')
+        encoded_str += "=" * ((4 - len(encoded_str) % 4) % 4)
+        return base64.b64decode(encoded_str).decode('utf-8')
+    except Exception as e:
+        return None
+
+# --- SOURCE 1: FILMYZILLA SCRAPER ---
 def try_filmyzilla_scrape(query):
     print(f"\n[Source 1] Searching Filmyzilla for: '{query}'...")
     session = requests.Session()
@@ -139,7 +147,7 @@ def try_filmyzilla_scrape(query):
         pass
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (HUMAN BROWSER SIMULATION) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (POPUP KILLER & TELEPORT BYPASS) ---
 async def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -196,8 +204,11 @@ async def try_animahd_scrape(query):
             context = await browser.new_context(user_agent=HEADERS["User-Agent"])
             page = await context.new_page()
             
-            # Block images and fonts so the browser runs extremely fast
-            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font"] else route.continue_())
+            # 1. Block images/fonts for raw speed
+            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
+
+            # 2. INSTANT POPUP KILLER - Automatically closes any ad tabs the site tries to spawn
+            page.on("popup", lambda popup: asyncio.create_task(popup.close()))
 
             print(f"[*] Browser loading Player Link: {target_ep_link}")
             try:
@@ -205,37 +216,51 @@ async def try_animahd_scrape(query):
             except Exception:
                 pass
                 
-            print("[*] Waiting for JS timers and auto-redirects...")
+            print("[*] Waiting for JS timers to redirect to gateway...")
             try:
-                await page.wait_for_url(re.compile(r"animesuki\.online|gate=|animahd\.online"), timeout=15000)
+                await page.wait_for_url(re.compile(r"animesuki\.online|target=|gate="), timeout=15000)
             except Exception:
                 pass
                 
-            if "animesuki" in page.url or "gate=" in page.url:
-                print(f"[+] Reached Gateway: {page.url}")
+            current_url = page.url
+            print(f"[+] Reached Gateway: {current_url}")
+            
+            # THE MAGIC TRICK: Read the destination straight out of the URL bar
+            if "target=" in current_url:
+                print("[*] Target found in URL! Skipping countdowns and ads...")
+                parsed = urlparse(current_url)
+                q_params = parse_qs(parsed.query)
+                if "target" in q_params:
+                    decoded = decode_base64_string(q_params["target"][0])
+                    if decoded:
+                        final_url = decoded
+                        print(f"[+] Successfully decoded teleport link -> {final_url}")
+            
+            if final_url:
+                if "eid=" in final_url and "passed=" not in final_url:
+                    final_url += "&passed=1" if "?" in final_url else "?passed=1"
+                print(f"[*] Teleporting directly to final host...")
                 try:
-                    continue_btn = page.locator("text=Continue")
-                    await continue_btn.wait_for(state="visible", timeout=15000)
-                    await continue_btn.click()
-                    print("[+] Browser clicked 'Continue'")
-                    
-                    dest_btn = page.locator("text=Go To Destination")
-                    await dest_btn.wait_for(state="visible", timeout=15000)
-                    await dest_btn.click()
-                    print("[+] Browser clicked 'Go To Destination'")
-                    
-                    print("[*] Waiting for final streaming host...")
-                    await page.wait_for_url(re.compile(r"animahd\.online|eid="), timeout=20000)
-                except Exception as e:
-                    print(f"[-] Browser click error: {e}")
+                    await page.goto(final_url, timeout=20000)
+                except Exception:
+                    pass
+            else:
+                # FALLBACK: If target isn't in the URL, violently click buttons while ignoring ad popups
+                print("[-] Target not in URL. Falling back to aggressive button mashing...")
+                for _ in range(15): # Hammer it for ~15 seconds
+                    if "eid=" in page.url or "animahd.online" in page.url:
+                        break
+                    try:
+                        btn = page.locator("a, button").filter(has_text=re.compile(r"Continue|Go To Destination", re.IGNORECASE)).first
+                        if await btn.is_visible(timeout=1000):
+                            await btn.click(force=True) # Force click ignores overlays!
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(1000)
             
-            final_url = page.url
-            print(f"[+] Final Reached Host: {final_url}")
+            print(f"[+] Final Host Loaded: {page.url}")
             
-            if "eid=" in final_url and "passed=" not in final_url:
-                final_url += "&passed=1" if "?" in final_url else "?passed=1"
-                await page.goto(final_url)
-                
+            # Extract download button
             links = await page.query_selector_all("a")
             for link in links:
                 text = (await link.inner_text()).lower()
@@ -252,7 +277,7 @@ async def try_animahd_scrape(query):
             
         print(f"[+] Extracting file directly from: {download_url}")
         local_dl = "temp_animahd_stream.mkv"
-        session.headers.update({"Referer": final_url})
+        session.headers.update({"Referer": final_url or page.url})
         with session.get(download_url, stream=True, allow_redirects=True, timeout=25) as res:
             res.raise_for_status()
             with open(local_dl, "wb") as f:
