@@ -205,7 +205,7 @@ async def try_animahd_scrape(query):
             context = await browser.new_context(user_agent=HEADERS["User-Agent"], accept_downloads=True)
             page = await context.new_page()
             
-            # Setup native download listener (catches downloads in current page and any pop-up tabs)
+            # Setup GLOBAL native download listener for ALL tabs/popups
             loop = asyncio.get_running_loop()
             download_future = loop.create_future()
             
@@ -216,8 +216,11 @@ async def try_animahd_scrape(query):
             page.on("download", _on_download)
             context.on("page", lambda new_page: new_page.on("download", _on_download))
             
+            # Block ONLY images and fonts. Do NOT close popups.
             await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font"] else route.continue_())
-            page.on("request", lambda req: captured_urls.append(req.url))
+            
+            # Capture network requests across the ENTIRE browser context, including popups
+            context.on("request", lambda req: captured_urls.append(req.url))
 
             print(f"[*] Browser loading Player Link: {target_ep_link}")
             try:
@@ -272,23 +275,23 @@ async def try_animahd_scrape(query):
                 except Exception:
                     pass
             
-            # --- THE ULTIMATE FIX: FORCE NATIVE DOWNLOADING ---
             local_dl = "temp_animahd_stream.mkv"
             
-            # 1. Did the browser natively trigger a "Save As" download dialog from the button clicks?
+            # 1. Did the browser natively trigger a download from the button clicks?
             try:
-                download_obj = await asyncio.wait_for(asyncio.shield(download_future), timeout=12.0)
-                print(f"[+] Native browser download triggered by button! Saving to disk (Bypasses 403)...")
+                download_obj = await asyncio.wait_for(asyncio.shield(download_future), timeout=15.0)
+                print(f"[+] Native browser download triggered! Saving to disk (Bypasses 403)...")
                 await download_obj.save_as(local_dl)
                 await browser.close()
                 return local_dl
             except asyncio.TimeoutError:
-                pass
+                print("[-] No immediate native download detected. Searching network interceptor logs...")
             
-            # 2. If no direct trigger, search our network interceptor
+            # 2. Search our network interceptor for the hidden link
             for url in captured_urls:
-                if ".mkv" in url.lower() or ".mp4" in url.lower() or "workers.dev" in url.lower() or "download=true" in url.lower():
-                    if "animahd" not in url:
+                if re.search(r'\.mkv|\.mp4|workers\.dev|download=true', url, re.IGNORECASE):
+                    # Ensure we don't accidentally grab the main HTML page
+                    if url != page.url and "latestanimeepisodes" not in url:
                         download_url = url
                         print(f"[+] Intercepted media request: {download_url}")
                         break
@@ -321,12 +324,20 @@ async def try_animahd_scrape(query):
                 except Exception:
                     print(f"[-] Native download check timed out. Verifying if it is an HTML page (like Google Drive)...")
                     
-                    if "drive.google.com" in page.url or "drive.google.com" in download_url:
+                    # Ensure we check both the main tab and any new pop-up tabs for the Google Drive warning
+                    active_pages = context.pages
+                    drive_page = None
+                    for p_tab in active_pages:
+                        if "drive.google.com" in p_tab.url:
+                            drive_page = p_tab
+                            break
+                            
+                    if drive_page:
                         print("[*] Caught Google Drive Virus Scan warning! Clicking bypass...")
                         try:
-                            await page.wait_for_selector("form#download-form", timeout=10000)
-                            async with page.expect_download(timeout=120000) as drive_dl_info:
-                                await page.evaluate("document.querySelector('form#download-form').submit()")
+                            await drive_page.wait_for_selector("form#download-form", timeout=10000)
+                            async with drive_page.expect_download(timeout=120000) as drive_dl_info:
+                                await drive_page.evaluate("document.querySelector('form#download-form').submit()")
                             drive_dl = await drive_dl_info.value
                             print("[+] Google Drive bypass successful! Saving to disk...")
                             await drive_dl.save_as(local_dl)
@@ -335,7 +346,7 @@ async def try_animahd_scrape(query):
                         except Exception as drive_e:
                             print(f"[-] Failed to bypass Google Drive: {drive_e}")
                     else:
-                        print(f"[-] Page resolved to: {page.url} - Could not locate video stream.")
+                        print(f"[-] Stream could not be forced via JS. Failing back...")
 
             await browser.close()
         return None
