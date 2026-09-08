@@ -8,19 +8,21 @@ on:
         required: true
         type: string
 
+# Cancels duplicate triggers for the EXACT SAME movie, but allows different movies to run in parallel
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.movie_name }}
   cancel-in-progress: true
 
 jobs:
-  download_and_sync:
+  # ==========================================
+  # STAGE 1: WEB SCRAPERS (PARALLEL EXECUTION)
+  # ==========================================
+  web_scrape:
     runs-on: ubuntu-latest
-    
-    # --- THIS IS THE FIX ---
-    # Grants the github-actions[bot] permission to push the movies.json commit
     permissions:
-      contents: write 
-    # -----------------------
+      contents: write
+    outputs:
+      downloaded: ${{ steps.run_web.outputs.downloaded }}
 
     steps:
       - name: Checkout Repository
@@ -43,9 +45,67 @@ jobs:
           playwright install chromium
           playwright install-deps
 
-      - name: Run Downloader & Upload to Drive
+      - name: Run Web Scrapers (Filmyzilla & AnimaHD)
+        id: run_web
         env:
           MOVIE_NAME: ${{ inputs.movie_name }}
+          RUN_MODE: "web"
+          GCP_CLIENT_ID: ${{ secrets.GCP_CLIENT_ID }}
+          GCP_CLIENT_SECRET: ${{ secrets.GCP_CLIENT_SECRET }}
+          GCP_REFRESH_TOKEN: ${{ secrets.GCP_REFRESH_TOKEN }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        run: python downloader.py
+
+      - name: Commit Updated movies.json
+        if: steps.run_web.outputs.downloaded == 'true'
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add movies.json
+          git diff-index --quiet HEAD || git commit -m "Update movies.json for ${{ inputs.movie_name }}"
+          for i in {1..5}; do
+            git pull --rebase origin main && git push && break || sleep 3
+          done
+
+  # =======================================================
+  # STAGE 2: TELEGRAM FALLBACK (STRICT SEQUENTIAL QUEUE)
+  # =======================================================
+  telegram_fallback:
+    needs: web_scrape
+    if: needs.web_scrape.outputs.downloaded != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    # THIS ENSURES ONLY ONE TELEGRAM INSTANCE RUNS AT A TIME GLOBALLY
+    concurrency:
+      group: telegram-session-lock
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Dependencies (Lightweight - No Playwright Needed)
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests telethon google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
+      - name: Run Telegram Downloader
+        id: run_tg
+        env:
+          MOVIE_NAME: ${{ inputs.movie_name }}
+          RUN_MODE: "telegram"
           TG_SESSION: ${{ secrets.TG_SESSION }}
           GCP_CLIENT_ID: ${{ secrets.GCP_CLIENT_ID }}
           GCP_CLIENT_SECRET: ${{ secrets.GCP_CLIENT_SECRET }}
@@ -54,9 +114,12 @@ jobs:
         run: python downloader.py
 
       - name: Commit Updated movies.json
+        if: steps.run_tg.outputs.downloaded == 'true'
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add movies.json
-          git commit -m "Update movies.json for ${{ inputs.movie_name }}" || echo "No changes to commit"
-          git push
+          git diff-index --quiet HEAD || git commit -m "Update movies.json for ${{ inputs.movie_name }}"
+          for i in {1..5}; do
+            git pull --rebase origin main && git push && break || sleep 3
+          done
