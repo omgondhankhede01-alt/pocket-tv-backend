@@ -146,7 +146,7 @@ def try_filmyzilla_scrape(query):
         pass
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (NETWORK INTERCEPTOR & 3-STEP CLICKER) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (PLAYWRIGHT NATIVE DOWNLOADER) ---
 async def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -197,18 +197,21 @@ async def try_animahd_scrape(query):
         
         download_url = None
         final_url = None
-        pl_cookies = []
-        captured_urls = [] # Will act as our interceptor net
+        captured_urls = []
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            context = await browser.new_context(user_agent=HEADERS["User-Agent"])
+            
+            # Accept downloads explicitly to ensure Playwright doesn't block the file!
+            context = await browser.new_context(user_agent=HEADERS["User-Agent"], accept_downloads=True)
             page = await context.new_page()
             
-            # Block ONLY images and fonts so we don't accidentally abort media streams!
-            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font"] else route.continue_())
+            # Setup native download listener
+            loop = asyncio.get_running_loop()
+            download_future = loop.create_future()
+            page.on("download", lambda d: download_future.set_result(d) if not download_future.done() else None)
             
-            # Log every single network request that flies by
+            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font"] else route.continue_())
             page.on("request", lambda req: captured_urls.append(req.url))
 
             print(f"[*] Browser loading Player Link: {target_ep_link}")
@@ -245,10 +248,8 @@ async def try_animahd_scrape(query):
                 except Exception:
                     pass
             
-            final_url = page.url
-            print(f"[+] Final Reached Host: {final_url}")
+            print(f"[+] Final Reached Host: {page.url}")
             
-            # --- THE MAGIC FIX: 3-STEP BUTTON CLICKER ---
             print("[*] Executing multi-step JS button sequence...")
             click_sequence = [
                 r"Download Episode",
@@ -261,36 +262,31 @@ async def try_animahd_scrape(query):
                     btn = page.get_by_text(re.compile(step_regex, re.IGNORECASE)).first
                     if await btn.is_visible(timeout=8000):
                         print(f"[+] Human Sim: Clicking '{step_regex}'")
-                        
-                        # Just in case the final button actually has the href embedded, we steal it before clicking
-                        if "Final Step" in step_regex:
-                            href = await btn.get_attribute("href")
-                            if href and href != "#" and not href.startswith("javascript"):
-                                download_url = urljoin(page.url, href)
-                                print(f"[+] Found direct href in final button: {download_url}")
-                                
                         await btn.click(force=True)
-                        await page.wait_for_timeout(4000) # Give the JS time to react
+                        await page.wait_for_timeout(4000)
                 except Exception:
                     pass
             
-            # 1. Did the clicker trigger a network request for the media? Check our interceptor net!
-            if not download_url:
-                for url in captured_urls:
-                    if ".mkv" in url.lower() or ".mp4" in url.lower() or "drive.google.com/file" in url.lower() or "download=true" in url.lower():
-                        download_url = url
-                        print(f"[+] Intercepted media request: {download_url}")
-                        break
-                        
-            # 2. Did the clicker open the file in a new tab? Check all open tabs!
-            if not download_url:
-                for p_tab in context.pages:
-                    if ".mkv" in p_tab.url.lower() or ".mp4" in p_tab.url.lower() or "drive.google.com/file" in p_tab.url.lower():
-                        download_url = p_tab.url
-                        print(f"[+] Found media in newly opened tab: {download_url}")
-                        break
-                        
-            # 3. Last resort fallback to scanning the DOM
+            # --- THE MAGIC FIX: FORCE PLAYWRIGHT TO DOWNLOAD THE FILE ---
+            local_dl = "temp_animahd_stream.mkv"
+            
+            # 1. Did the browser natively trigger a "Save As" download dialog?
+            try:
+                download_obj = await asyncio.wait_for(asyncio.shield(download_future), timeout=5.0)
+                print(f"[+] Native browser download triggered! Saving to disk (Bypasses 403)...")
+                await download_obj.save_as(local_dl)
+                await browser.close()
+                return local_dl
+            except asyncio.TimeoutError:
+                pass
+            
+            # 2. If no native download, search our network interceptor for the hidden direct link
+            for url in captured_urls:
+                if ".mkv" in url.lower() or ".mp4" in url.lower() or "workers.dev" in url.lower():
+                    download_url = url
+                    print(f"[+] Intercepted media request: {download_url}")
+                    break
+                    
             if not download_url:
                 links = await page.query_selector_all("a")
                 for link in links:
@@ -299,48 +295,49 @@ async def try_animahd_scrape(query):
                     if href and ("download" in text or "url?id=" in href or ".mkv" in href or ".mp4" in href):
                         download_url = urljoin(page.url, href)
                         break
+
+            if download_url:
+                print(f"[+] Fetching file directly via Playwright Network Engine (Bypasses Cloudflare 403)")
+                # We use context.request.get() instead of requests.get() because it uses the real Chromium TLS stack
+                r_media = await context.request.get(download_url, timeout=120000)
+                
+                if r_media.ok:
+                    content_type = r_media.headers.get("content-type", "")
+                    
+                    if "text/html" in content_type:
+                        print("[-] WARNING: Host returned HTML! Google Drive virus scan or firewall detected. Falling back...")
+                        pl_cookies = await context.cookies()
+                        session.headers.update({"Referer": page.url})
+                        for c in pl_cookies:
+                            session.cookies.set(c['name'], c['value'], domain=c['domain'], path=c['path'])
+                            
+                        r_media_req = session.get(download_url, stream=True, allow_redirects=True, timeout=30)
+                        if "drive.google.com" in r_media_req.url:
+                            print("[*] Automatically bypassing Google Drive warning...")
+                            soup_drive = BeautifulSoup(r_media_req.text, "html.parser")
+                            form = soup_drive.find("form", id="download-form")
+                            if form:
+                                confirm_url = urljoin(r_media_req.url, form.get("action"))
+                                r_media_req = session.get(confirm_url, stream=True, allow_redirects=True, timeout=30)
+                                
+                        with open(local_dl, "wb") as f:
+                            for chunk in r_media_req.iter_content(chunk_size=1024*1024):
+                                if chunk: f.write(chunk)
+                                
+                        await browser.close()
+                        return local_dl
+                    else:
+                        print("[+] Download successful via Playwright!")
+                        with open(local_dl, "wb") as f:
+                            f.write(await r_media.body())
+                        await browser.close()
+                        return local_dl
+                else:
+                    print(f"[-] Playwright fetch failed with status {r_media.status}.")
             
-            pl_cookies = await context.cookies()
             await browser.close()
             
-        if not download_url:
-            print("[-] Could not locate final download button via browser.")
-            return None
-            
-        print(f"[+] Extracting file directly from: {download_url}")
-        local_dl = "temp_animahd_stream.mkv"
-        session.headers.update({"Referer": final_url})
-        
-        # Inject Playwright cookies so the server thinks we are the same verified human
-        for c in pl_cookies:
-            session.cookies.set(c['name'], c['value'], domain=c['domain'], path=c['path'])
-            
-        r_media = session.get(download_url, stream=True, allow_redirects=True, timeout=25)
-        r_media.raise_for_status()
-        
-        # Handle Google Drive Virus Scan Warnings & Junk HTML
-        content_type = r_media.headers.get("Content-Type", "")
-        if "text/html" in content_type:
-            if "drive.google.com" in r_media.url:
-                print("[*] Caught Google Drive Virus Scan warning! Automatically bypassing...")
-                soup_drive = BeautifulSoup(r_media.text, "html.parser")
-                form = soup_drive.find("form", id="download-form")
-                if form:
-                    confirm_url = urljoin(r_media.url, form.get("action"))
-                    print(f"[+] Found bypass URL: {confirm_url}")
-                    r_media = session.get(confirm_url, stream=True, allow_redirects=True, timeout=25)
-                    r_media.raise_for_status()
-                else:
-                    print("[-] Could not find the bypass form on the Google Drive page.")
-            else:
-                print("[-] WARNING: The destination returned an HTML page instead of a video! It might be a firewall block.")
-                print(f"[-] Final Stream URL: {r_media.url}")
-        
-        with open(local_dl, "wb") as f:
-            for chunk in r_media.iter_content(chunk_size=1024*1024):
-                if chunk: f.write(chunk)
-                    
-        return local_dl
+        return None
 
     except Exception as e:
         print(f"[-] AnimaHD browser scraper error: {e}")
