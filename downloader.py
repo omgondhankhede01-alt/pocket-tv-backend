@@ -146,7 +146,7 @@ def try_filmyzilla_scrape(query):
         pass
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (COOKIE SYNC, TELEPORT & 3-STEP CLICKER) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (NETWORK INTERCEPTOR & 3-STEP CLICKER) ---
 async def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -198,14 +198,18 @@ async def try_animahd_scrape(query):
         download_url = None
         final_url = None
         pl_cookies = []
+        captured_urls = [] # Will act as our interceptor net
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
             context = await browser.new_context(user_agent=HEADERS["User-Agent"])
             page = await context.new_page()
             
+            # Block ONLY images and fonts so we don't accidentally abort media streams!
             await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font"] else route.continue_())
-            page.on("popup", lambda popup: asyncio.create_task(popup.close()))
+            
+            # Log every single network request that flies by
+            page.on("request", lambda req: captured_urls.append(req.url))
 
             print(f"[*] Browser loading Player Link: {target_ep_link}")
             try:
@@ -254,23 +258,47 @@ async def try_animahd_scrape(query):
             
             for step_regex in click_sequence:
                 try:
-                    # Look for any element matching the text regex
                     btn = page.get_by_text(re.compile(step_regex, re.IGNORECASE)).first
-                    if await btn.is_visible(timeout=5000):
+                    if await btn.is_visible(timeout=8000):
                         print(f"[+] Human Sim: Clicking '{step_regex}'")
+                        
+                        # Just in case the final button actually has the href embedded, we steal it before clicking
+                        if "Final Step" in step_regex:
+                            href = await btn.get_attribute("href")
+                            if href and href != "#" and not href.startswith("javascript"):
+                                download_url = urljoin(page.url, href)
+                                print(f"[+] Found direct href in final button: {download_url}")
+                                
                         await btn.click(force=True)
-                        await page.wait_for_timeout(3500) # Give JS time to change the button state
+                        await page.wait_for_timeout(4000) # Give the JS time to react
                 except Exception:
                     pass
             
-            # After clicking all the buttons, look for the actual download href
-            links = await page.query_selector_all("a")
-            for link in links:
-                text = (await link.inner_text()).lower()
-                href = await link.get_attribute("href")
-                if href and ("download" in text or "url?id=" in href or ".mkv" in href or ".mp4" in href):
-                    download_url = urljoin(page.url, href)
-                    break
+            # 1. Did the clicker trigger a network request for the media? Check our interceptor net!
+            if not download_url:
+                for url in captured_urls:
+                    if ".mkv" in url.lower() or ".mp4" in url.lower() or "drive.google.com/file" in url.lower() or "download=true" in url.lower():
+                        download_url = url
+                        print(f"[+] Intercepted media request: {download_url}")
+                        break
+                        
+            # 2. Did the clicker open the file in a new tab? Check all open tabs!
+            if not download_url:
+                for p_tab in context.pages:
+                    if ".mkv" in p_tab.url.lower() or ".mp4" in p_tab.url.lower() or "drive.google.com/file" in p_tab.url.lower():
+                        download_url = p_tab.url
+                        print(f"[+] Found media in newly opened tab: {download_url}")
+                        break
+                        
+            # 3. Last resort fallback to scanning the DOM
+            if not download_url:
+                links = await page.query_selector_all("a")
+                for link in links:
+                    text = (await link.inner_text()).lower()
+                    href = await link.get_attribute("href")
+                    if href and ("download" in text or "url?id=" in href or ".mkv" in href or ".mp4" in href):
+                        download_url = urljoin(page.url, href)
+                        break
             
             pl_cookies = await context.cookies()
             await browser.close()
@@ -283,12 +311,14 @@ async def try_animahd_scrape(query):
         local_dl = "temp_animahd_stream.mkv"
         session.headers.update({"Referer": final_url})
         
+        # Inject Playwright cookies so the server thinks we are the same verified human
         for c in pl_cookies:
             session.cookies.set(c['name'], c['value'], domain=c['domain'], path=c['path'])
             
         r_media = session.get(download_url, stream=True, allow_redirects=True, timeout=25)
         r_media.raise_for_status()
         
+        # Handle Google Drive Virus Scan Warnings & Junk HTML
         content_type = r_media.headers.get("Content-Type", "")
         if "text/html" in content_type:
             if "drive.google.com" in r_media.url:
