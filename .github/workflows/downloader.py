@@ -146,7 +146,7 @@ def try_filmyzilla_scrape(query):
         pass
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (STREAM EXTRACTOR) ---
+# --- SOURCE 2: ANIMAHd SCRAPER ---
 async def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -201,10 +201,10 @@ async def try_animahd_scrape(query):
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+            
             context = await browser.new_context(user_agent=HEADERS["User-Agent"], accept_downloads=True)
             page = await context.new_page()
             
-            # Setup native download listener
             loop = asyncio.get_running_loop()
             download_future = loop.create_future()
             page.on("download", lambda d: download_future.set_result(d) if not download_future.done() else None)
@@ -267,7 +267,6 @@ async def try_animahd_scrape(query):
             
             local_dl = "temp_animahd_stream.mkv"
             
-            # 1. Did the browser natively trigger a "Save As" download dialog?
             try:
                 download_obj = await asyncio.wait_for(asyncio.shield(download_future), timeout=8.0)
                 print(f"[+] Native browser download triggered by button! Saving to disk...")
@@ -277,7 +276,6 @@ async def try_animahd_scrape(query):
             except asyncio.TimeoutError:
                 pass
             
-            # 2. Search interceptor net for the workers.dev stream link
             for url in captured_urls:
                 if ".mkv" in url.lower() or ".mp4" in url.lower() or "workers.dev" in url.lower() or "download=true" in url.lower():
                     if "favicon" not in url.lower() and "google-analytics" not in url.lower():
@@ -285,17 +283,31 @@ async def try_animahd_scrape(query):
                         print(f"[+] Intercepted media stream link: {download_url}")
                         break
 
+            if not download_url:
+                links = await page.query_selector_all("a")
+                for link in links:
+                    text = (await link.inner_text()).lower()
+                    href = await link.get_attribute("href")
+                    if href and ("download" in text or "url?id=" in href or ".mkv" in href or ".mp4" in href):
+                        download_url = urljoin(page.url, href)
+                        break
+
             if download_url:
-                print(f"[+] Ripping stream directly into memory (Bypassing Cloudflare 403 & Inline Players)...")
+                print(f"[+] Ripping stream directly into memory (Spoofing exact Chrome Navigation Headers)...")
                 
-                # We MUST spoof the Referer to bypass Hotlink Protection on workers.dev
+                # --- THE MAGIC FIX: PERFECT BROWSER SPOOFING HEADERS ---
                 fetch_headers = {
                     "User-Agent": HEADERS["User-Agent"],
                     "Referer": page.url,
-                    "Accept": "*/*"
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "cross-site",
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1"
                 }
                 
-                # Fetch directly using Playwright's network stack so TLS fingerprints look 100% human
                 r_media = await context.request.get(download_url, headers=fetch_headers, timeout=300000)
                 
                 if r_media.ok:
@@ -329,7 +341,21 @@ async def try_animahd_scrape(query):
                         await browser.close()
                         return local_dl
                 else:
-                    print(f"[-] Chromium fetch failed with HTTP {r_media.status}")
+                    # --- THE ULTIMATE FALLBACK: NATIVE TAB NAVIGATION ---
+                    print(f"[-] Chromium fetch failed with HTTP {r_media.status}. Trying native tab navigation fallback...")
+                    try:
+                        response = await page.goto(download_url, timeout=300000)
+                        if response and response.ok:
+                            print("[+] Direct tab navigation bypassed Cloudflare! Ripping video bytes...")
+                            body_bytes = await response.body()
+                            with open(local_dl, "wb") as f:
+                                f.write(body_bytes)
+                            await browser.close()
+                            return local_dl
+                        else:
+                            print(f"[-] Direct tab navigation failed with status {response.status if response else 'Unknown'}")
+                    except Exception as e:
+                        print(f"[-] Direct tab navigation exception: {e}")
 
             await browser.close()
         return None
