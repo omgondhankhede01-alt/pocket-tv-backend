@@ -101,40 +101,14 @@ def sync_movies_json():
     print("[*] movies.json synced successfully.")
 
 def decode_base64_string(encoded_str):
+    """Safely decodes Base64 strings with proper padding restoration."""
     try:
-        encoded_str += "=" * ((-len(encoded_str)) % 4)
+        encoded_str = encoded_str.replace('-', '+').replace('_', '/')
+        encoded_str += "=" * ((4 - len(encoded_str) % 4) % 4)
         return base64.b64decode(encoded_str).decode('utf-8')
-    except Exception:
+    except Exception as e:
+        print(f"[-] Base64 decode error: {e}")
         return None
-
-def resolve_gateway_url(url):
-    current_url = url
-    for i in range(5):
-        if "sec_route=1" in current_url and "p=" in current_url:
-            try:
-                p_part = current_url.split("p=")[1].split("&")[0]
-                decoded = decode_base64_string(p_part)
-                if decoded:
-                    print(f"[+] Gateway unwrapped (sec_route): {decoded}")
-                    current_url = decoded
-                    continue
-            except Exception:
-                pass
-        
-        parsed = urlparse(current_url)
-        query_params = parse_qs(parsed.query)
-        if "target=" in query_params:
-            try:
-                target_part = query_params["target"][0].split("&")[0]
-                decoded = decode_base64_string(target_part)
-                if decoded:
-                    print(f"[+] Gateway unwrapped (target): {decoded}")
-                    current_url = decoded
-                    continue
-            except Exception:
-                pass
-        break
-    return current_url
 
 # --- SOURCE 1: FILMYZILLA SCRAPER ---
 def try_filmyzilla_scrape(query):
@@ -221,7 +195,7 @@ def try_filmyzilla_scrape(query):
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (PLAYER JS EXTRACTOR FIX) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (3-STEP URL EXTRACTOR) ---
 def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -260,18 +234,17 @@ def try_animahd_scrape(query):
         r2 = session.get(anime_page_url, timeout=12)
         soup2 = BeautifulSoup(r2.text, "html.parser")
         
-        # Look for the player link associated with the episode
         episode_links = []
         for a in soup2.find_all("a", href=True):
-            text = a.get_text(strip=True)
+            text = a.get_text(strip=True).lower()
             href = a['href']
-            if "player" in href.lower() or "file_id=" in href.lower() or "watch" in href.lower():
+            if re.search(r'(?:e|ep|episode|s\d+e)\s*\d+', text) or ".mkv" in text or ".mp4" in text:
                 episode_links.append((text, urljoin(anime_page_url, href)))
                 
         target_ep_link = None
         ep_num = int(episode_match.group(1)) if episode_match else 1
         for text, link in episode_links:
-            if re.search(rf'\b(?:e|ep|episode)\s*0?{ep_num}\b', text, re.IGNORECASE) or re.search(rf's\d+e0?{ep_num}\b', text, re.IGNORECASE):
+            if re.search(rf'\b(?:e|ep|episode)\s*0?{ep_num}\b', text) or re.search(rf's\d+e0?{ep_num}\b', text):
                 target_ep_link = link
                 break
                 
@@ -282,38 +255,52 @@ def try_animahd_scrape(query):
             print("[-] Episode player link not found on series page.")
             return None
             
-        print(f"[*] Visiting Initial Player Link: {target_ep_link}")
+        # =========================================================
+        # THE 3-STEP URL EXTRACTION PIPELINE
+        # =========================================================
+        
+        # STEP 1: Fetch the initial player page
+        print(f"[*] Step 1 -> Visiting Initial Player Link: {target_ep_link}")
         r_player = session.get(target_ep_link, timeout=15)
         
-        # EXTRACT JS REDIRECT: Look for hidden sec_route or target links inside the raw HTML/JavaScript
+        # STEP 2: Extract the Animesuki Gateway Link from the HTML source
         gateway_url = None
+        gw_match = re.search(r'(https?://[^"\'\s<>]+(?:animesuki\.online|target=|sec_route=1)[^"\'\s<>]+)', r_player.text)
         
-        # Match absolute URLs
-        abs_match = re.search(r'(https?://[^\s\'">]+(?:sec_route=1|target=|animesuki)[^\s\'">]+)', r_player.text)
-        if abs_match:
-            gateway_url = abs_match.group(1)
+        if gw_match:
+            gateway_url = gw_match.group(1).replace("&amp;", "&")
+            print(f"[*] Step 2 -> Extracted Gateway Link: {gateway_url}")
         else:
-            # Match relative URLs
-            rel_match = re.search(r'((?:/\?sec_route=1|/\?gate=|/\?target=)[^\s\'">]+)', r_player.text)
-            if rel_match:
-                gateway_url = urljoin(r_player.url, rel_match.group(1))
-                
-        if not gateway_url:
-            print("[-] Failed to extract JavaScript redirect from the player page.")
+            print("[-] Could not find the Gateway Link (animesuki.online) in the player page source.")
             return None
             
-        print(f"[*] Extracted Hidden Gateway: {gateway_url}")
+        # STEP 3: Decode the Base64 Target to find the DiscoverNewAnime Destination
+        parsed = urlparse(gateway_url)
+        q_params = parse_qs(parsed.query)
         
-        # Decode the hidden gateway to reach the real destination page
-        resolved_page = resolve_gateway_url(gateway_url)
-        if "?" in resolved_page:
-            resolved_page += "&passed=1"
-        else:
-            resolved_page += "?passed=1"
+        final_dest = None
+        if "target" in q_params:
+            final_dest = decode_base64_string(q_params["target"][0])
+        elif "p" in q_params:
+            final_dest = decode_base64_string(q_params["p"][0])
             
-        print(f"[*] Final Target Destination: {resolved_page}")
+        if not final_dest:
+            print("[-] Could not decode base64 target from gateway link.")
+            return None
+            
+        # Add the authentication parameter
+        if "?" in final_dest:
+            final_dest += "&passed=1"
+        else:
+            final_dest += "?passed=1"
+            
+        print(f"[*] Step 3 -> Final Target Destination: {final_dest}")
         
-        r3 = session.get(resolved_page, timeout=15, allow_redirects=True)
+        # =========================================================
+        # FETCH FINAL DESTINATION & DOWNLOAD
+        # =========================================================
+        
+        r3 = session.get(final_dest, timeout=15, allow_redirects=True)
         soup3 = BeautifulSoup(r3.text, "html.parser")
         
         download_url = None
