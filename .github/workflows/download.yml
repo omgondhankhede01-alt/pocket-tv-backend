@@ -8,9 +8,6 @@ on:
         required: true
         type: string
 
-# THIS IS THE FIX: It groups runs by the movie name.
-# "Naruto S01" and "Bleach S01" will run at the same time.
-# But pressing "Naruto S01" twice will cancel the first one.
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.movie_name }}
   cancel-in-progress: true
@@ -18,6 +15,13 @@ concurrency:
 jobs:
   download_and_sync:
     runs-on: ubuntu-latest
+    
+    # --- THIS IS THE FIX ---
+    # Grants the github-actions[bot] permission to push the movies.json commit
+    permissions:
+      contents: write 
+    # -----------------------
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
