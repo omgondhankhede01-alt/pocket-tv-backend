@@ -4,52 +4,55 @@ on:
   workflow_dispatch:
     inputs:
       movie_name:
-        description: 'Name of the movie or series to download'
+        description: 'Movie or Series Name (e.g., Smoking Behind the Supermarket with You S01E02)'
         required: true
         type: string
 
-concurrency: 
-  group: telegram-downloader
-  cancel-in-progress: false
+# THIS IS THE FIX: It groups runs by the movie name.
+# "Naruto S01" and "Bleach S01" will run at the same time.
+# But pressing "Naruto S01" twice will cancel the first one.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.movie_name }}
+  cancel-in-progress: true
 
 jobs:
   download_and_sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install FFmpeg
+      - name: Install Ffmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
       - name: Install Dependencies
         run: |
-          pip install telethon beautifulsoup4 requests google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 telethon google-api-python-client google-auth-httplib2 google-auth-oauthlib playwright
+          playwright install chromium
+          playwright install-deps
 
       - name: Run Downloader & Upload to Drive
         env:
+          MOVIE_NAME: ${{ inputs.movie_name }}
           TG_SESSION: ${{ secrets.TG_SESSION }}
           GCP_CLIENT_ID: ${{ secrets.GCP_CLIENT_ID }}
           GCP_CLIENT_SECRET: ${{ secrets.GCP_CLIENT_SECRET }}
           GCP_REFRESH_TOKEN: ${{ secrets.GCP_REFRESH_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-          MOVIE_NAME: ${{ inputs.movie_name }}
         run: python downloader.py
 
       - name: Commit Updated movies.json
         run: |
-          git config --global user.name "PocketFlix Bot"
-          git config --global user.email "bot@pocketflix.local"
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add movies.json
-          git commit -m "Auto-updated movie library from Drive" || echo "No changes to commit"
+          git commit -m "Update movies.json for ${{ inputs.movie_name }}" || echo "No changes to commit"
           git push
