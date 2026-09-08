@@ -108,23 +108,17 @@ def decode_base64_string(encoded_str):
         return None
 
 def resolve_gateway_url(url):
-    """Directly unwrap multi-layer base64 wrapper URLs without breaking"""
     current_url = url
-    print(f"[*] Starting gateway resolution for: {current_url}")
     for i in range(5):
-        # 1. Check for sec_route wrapper (p= parameter)
         if "sec_route=1" in current_url and "p=" in current_url:
             try:
                 p_part = current_url.split("p=")[1].split("&")[0]
                 decoded = decode_base64_string(p_part)
                 if decoded:
-                    print(f"[+] Layer {i+1} Unwrapped (sec_route): {decoded}")
                     current_url = decoded
                     continue
-            except Exception as e:
-                print(f"[-] sec_route decode error: {e}")
-                
-        # 2. Check for gateway target wrapper (target= parameter)
+            except Exception:
+                pass
         parsed = urlparse(current_url)
         query_params = parse_qs(parsed.query)
         if "target=" in query_params:
@@ -132,12 +126,10 @@ def resolve_gateway_url(url):
                 target_part = query_params["target"][0].split("&")[0]
                 decoded = decode_base64_string(target_part)
                 if decoded:
-                    print(f"[+] Layer {i+1} Unwrapped (target): {decoded}")
                     current_url = decoded
                     continue
-            except Exception as e:
-                print(f"[-] target decode error: {e}")
-                
+            except Exception:
+                pass
         break
     return current_url
 
@@ -156,8 +148,7 @@ def try_filmyzilla_scrape(query):
         r = session.get(search_url, timeout=12)
         if r.status_code != 200:
             return None
-    except Exception as e:
-        print(f"[-] Filmyzilla error: {e}")
+    except Exception:
         return None
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -222,13 +213,12 @@ def try_filmyzilla_scrape(query):
                     if chunk:
                         f.write(chunk)
             return local_dl
-    except Exception as e:
-        print(f"[-] Filmyzilla download error: {e}")
+    except Exception:
         return None
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER ---
+# --- SOURCE 2: ANIMAHd SCRAPER (DIRECT SERIES-PAGE .MKV HUNTER) ---
 def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -267,56 +257,39 @@ def try_animahd_scrape(query):
         r2 = session.get(anime_page_url, timeout=12)
         soup2 = BeautifulSoup(r2.text, "html.parser")
         
-        episode_links = []
+        # Hunt directly for direct .mkv or file stream links embedded in the episode list container
+        target_dl_link = None
+        ep_num = int(episode_match.group(1)) if episode_match else 1
+        
         for a in soup2.find_all("a", href=True):
             text = a.get_text(strip=True)
             href = a['href']
-            if any(k in text.lower() for k in ["ep", "episode", "e0", "s0", "watch"]) or any(k in href.lower() for k in ["ep", "episode", "watch", "player"]):
-                episode_links.append((text, urljoin(anime_page_url, href)))
-                
-        target_ep_link = None
-        if episode_match and episode_links:
-            ep_num = int(episode_match.group(1))
-            for text, link in episode_links:
-                if re.search(rf'\b(ep|episode|e)\s*0?{ep_num}\b', text, re.IGNORECASE) or re.search(rf'e0?{ep_num}\b', link, re.IGNORECASE):
-                    target_ep_link = link
+            # Match elements containing the episode number and ending/containing media extensions or gateway links
+            if f"s01e{ep_num:02d}" in text.lower() or f"e{ep_num:02d}" in text.lower() or f"episode {ep_num}" in text.lower():
+                resolved = resolve_gateway_url(urljoin(anime_page_url, href))
+                if ".mkv" in resolved or ".mp4" in resolved or "url?id=" in resolved or "animahd.online" in resolved:
+                    target_dl_link = resolved
+                    print(f"[+] Found direct episode download link: {target_dl_link}")
                     break
                     
-        if not target_ep_link and episode_links:
-            target_ep_link = episode_links[0][1]
-            
-        if not target_ep_link:
-            print("[-] Episode link not found.")
+        # Fallback: scan all anchor links on the series page for any direct media links
+        if not target_dl_link:
+            for a in soup2.find_all("a", href=True):
+                href = a['href']
+                resolved = resolve_gateway_url(urljoin(anime_page_url, href))
+                if ".mkv" in resolved or ".mp4" in resolved:
+                    target_dl_link = resolved
+                    print(f"[+] Found fallback direct media link: {target_dl_link}")
+                    break
+
+        if not target_dl_link:
+            print("[-] Could not locate direct media link on series page.")
             return None
             
-        # Completely unwrap wrapper links to reach the destination page
-        resolved_page = resolve_gateway_url(target_ep_link)
-        if "?" in resolved_page:
-            resolved_page += "&passed=1"
-        else:
-            resolved_page += "?passed=1"
-            
-        print(f"[*] Final Unwrapped Destination: {resolved_page}")
-        
-        r3 = session.get(resolved_page, timeout=15, allow_redirects=True)
-        soup3 = BeautifulSoup(r3.text, "html.parser")
-        
-        download_url = None
-        for a in soup3.find_all("a", href=True):
-            text = a.get_text(strip=True).lower()
-            href = a['href']
-            if "download" in text or "url?id=" in href or ".mkv" in href or ".mp4" in href:
-                download_url = urljoin(r3.url, href)
-                break
-                
-        if not download_url:
-            print("[-] Download button not located on destination page.")
-            return None
-            
-        print(f"[+] Downloading file from: {download_url}")
+        print(f"[+] Downloading file from: {target_dl_link}")
         local_dl = "temp_animahd_stream.mkv"
-        session.headers.update({"Referer": r3.url})
-        with session.get(download_url, stream=True, allow_redirects=True, timeout=20) as res:
+        session.headers.update({"Referer": anime_page_url})
+        with session.get(target_dl_link, stream=True, allow_redirects=True, timeout=25) as res:
             res.raise_for_status()
             with open(local_dl, "wb") as f:
                 for chunk in res.iter_content(chunk_size=1024*1024):
@@ -363,7 +336,7 @@ async def try_telegram_bots(query):
 
         await client.disconnect()
     except Exception as e:
-        print(f"[-] Telegram bots fallback skipped due to network/auth limits: {e}")
+        print(f"[-] Telegram bots fallback skipped: {e}")
     return None
 
 def transcode_and_upload(source_file, title_label):
