@@ -59,6 +59,29 @@ def sanitize_title(title):
     else:
         return clean.title()
 
+def get_quality_score(text):
+    """
+    Calculates priority score to strictly enforce Min 720p, Max 1080p:
+    1080p -> 100
+    720p  -> 90
+    HD (unspecified 720/1080) -> 80
+    Unknown / unstated -> 40
+    2160p / 4K -> -50 (exceeds max 1080p constraint)
+    480p / 360p / 240p / CAM -> -100 (below min 720p constraint)
+    """
+    t = str(text).lower()
+    if re.search(r'\b(1080p|1080|fhd|full\s*hd)\b', t):
+        return 100
+    if re.search(r'\b(720p|720)\b', t):
+        return 90
+    if re.search(r'\b(hd|high\s*def)\b', t):
+        return 80
+    if re.search(r'\b(2160p|4k|uhd)\b', t):
+        return -50
+    if re.search(r'\b(480p|360p|240p|sd|dvdrip|camrip|cam|ts)\b', t):
+        return -100
+    return 40
+
 def get_drive_service():
     creds = Credentials(
         token=None,
@@ -73,8 +96,6 @@ def sync_movies_json():
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
     service = get_drive_service()
     query = f"'{folder_id}' in parents and trashed = false"
-    
-    # Added num_retries here to prevent timeouts during sync
     results = service.files().list(q=query, pageSize=200, fields="files(id, name, webViewLink, webContentLink)").execute(num_retries=3)
     
     movie_data = [{"id": f.get("id"), "name": f.get("name"), "webViewLink": f.get("webViewLink"), "webContentLink": f.get("webContentLink", "#")} for f in results.get('files', [])]
@@ -99,7 +120,7 @@ def decode_base64_string(encoded_str):
     except Exception:
         return None
 
-# --- SOURCE 1: FILMYZILLA SCRAPER ---
+# --- SOURCE 1: FILMYZILLA SCRAPER (QUALITY AWARE) ---
 def try_filmyzilla_scrape(query):
     print(f"\n[Source 1] Searching Filmyzilla for: '{query}'...")
     session = requests.Session()
@@ -115,25 +136,45 @@ def try_filmyzilla_scrape(query):
         return None
 
     soup = BeautifulSoup(r.text, "html.parser")
-    candidates = [(10, a.get_text(strip=True), urljoin(FILMYZILLA_DOMAIN, a['href'])) for a in soup.find_all("a", href=True) if any(seg in a['href'] for seg in ["/movie/", "/series/"]) and clean_text(base_title) in clean_text(a.get_text())]
+    candidates = []
+    for a in soup.find_all("a", href=True):
+        if any(seg in a['href'] for seg in ["/movie/", "/series/"]) and clean_text(base_title) in clean_text(a.get_text()):
+            href = urljoin(FILMYZILLA_DOMAIN, a['href'])
+            txt = a.get_text(strip=True)
+            score = get_quality_score(txt)
+            candidates.append((score, txt, href))
 
     if not candidates: return None
+    # Sort candidates by resolution quality (1080p > 720p > others, 480p pushed to bottom)
+    candidates.sort(key=lambda x: x[0], reverse=True)
     target_page = candidates[0][2]
     
     try:
         r2 = session.get(target_page, timeout=12)
         soup2 = BeautifulSoup(r2.text, "html.parser")
-        tier_candidates = [(a.get_text(strip=True), urljoin(FILMYZILLA_DOMAIN, a['href'])) for a in soup2.find_all("a", href=True) if "/server/" in a['href']]
+        tier_candidates = []
+        for a in soup2.find_all("a", href=True):
+            if "/server/" in a['href']:
+                href = urljoin(FILMYZILLA_DOMAIN, a['href'])
+                txt = a.get_text(strip=True)
+                score = get_quality_score(txt)
+                tier_candidates.append((score, txt, href))
 
         if not tier_candidates: return None
 
-        selected_tier = tier_candidates[0]
+        selected_tier = None
         if episode_match:
             ep_num = int(episode_match.group(1))
-            for text, link in tier_candidates:
-                if re.search(rf'\b(ep|episode|e)[-_\s]*0?{ep_num}\b', text, re.IGNORECASE):
-                    selected_tier = (text, link)
-                    break
+            ep_matching = [t for t in tier_candidates if re.search(rf'\b(ep|episode|e)[-_\s]*0?{ep_num}\b', t[1], re.IGNORECASE)]
+            if ep_matching:
+                ep_matching.sort(key=lambda x: x[0], reverse=True)
+                selected_tier = (ep_matching[0][1], ep_matching[0][2])
+        
+        if not selected_tier:
+            tier_candidates.sort(key=lambda x: x[0], reverse=True)
+            selected_tier = (tier_candidates[0][1], tier_candidates[0][2])
+
+        print(f"[*] Filmyzilla selected tier: '{selected_tier[0]}'")
 
         r3 = session.get(selected_tier[1], timeout=12)
         soup3 = BeautifulSoup(r3.text, "html.parser")
@@ -152,7 +193,7 @@ def try_filmyzilla_scrape(query):
         pass
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (NATIVE BROWSER DOWNLOADER) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (QUALITY AWARE) ---
 async def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -194,17 +235,29 @@ async def try_animahd_scrape(query):
         r2 = session.get(anime_page_url, timeout=12)
         soup2 = BeautifulSoup(r2.text, "html.parser")
         
-        episode_links = [(a.get_text(strip=True).lower(), urljoin(anime_page_url, a['href'])) for a in soup2.find_all("a", href=True) if re.search(r'(?:e|ep|episode|s\d+e)\s*\d+', a.get_text(strip=True).lower()) or ".mkv" in a.get_text(strip=True).lower() or ".mp4" in a.get_text(strip=True).lower()]
+        episode_links = []
+        for a in soup2.find_all("a", href=True):
+            txt = a.get_text(strip=True)
+            t_low = txt.lower()
+            if re.search(r'(?:e|ep|episode|s\d+e)\s*\d+', t_low) or ".mkv" in t_low or ".mp4" in t_low:
+                href = urljoin(anime_page_url, a['href'])
+                score = get_quality_score(txt)
+                episode_links.append((score, txt, href))
                 
         target_ep_link = None
         ep_num = int(episode_match.group(1)) if episode_match else 1
-        for text, link in episode_links:
-            if re.search(rf'\b(?:e|ep|episode)\s*0?{ep_num}\b', text) or re.search(rf's\d+e0?{ep_num}\b', text):
-                target_ep_link = link
-                break
-                
-        if not target_ep_link and episode_links:
-            target_ep_link = episode_links[0][1]
+        ep_matches = [
+            item for item in episode_links 
+            if re.search(rf'\b(?:e|ep|episode)\s*0?{ep_num}\b', item[1], re.IGNORECASE) or re.search(rf's\d+e0?{ep_num}\b', item[1], re.IGNORECASE)
+        ]
+        
+        if ep_matches:
+            ep_matches.sort(key=lambda x: x[0], reverse=True)
+            target_ep_link = ep_matches[0][2]
+            print(f"[*] Selected episode link: '{ep_matches[0][1]}' (Score: {ep_matches[0][0]})")
+        elif episode_links:
+            episode_links.sort(key=lambda x: x[0], reverse=True)
+            target_ep_link = episode_links[0][2]
             
         if not target_ep_link:
             print("[-] Episode link not found on series page.")
@@ -301,21 +354,31 @@ async def try_animahd_scrape(query):
             except asyncio.TimeoutError:
                 print("[-] No immediate native download detected. Searching network interceptor logs...")
             
+            scored_captured = []
             for url in captured_urls:
                 if re.search(r'\.mkv|\.mp4|workers\.dev|download=true', url, re.IGNORECASE):
                     if url != page.url and "latestanimeepisodes" not in url:
-                        download_url = url
-                        print(f"[+] Intercepted media request: {download_url}")
-                        break
+                        score = get_quality_score(url)
+                        scored_captured.append((score, url))
+                        
+            if scored_captured:
+                scored_captured.sort(key=lambda x: x[0], reverse=True)
+                download_url = scored_captured[0][1]
+                print(f"[+] Intercepted media request (Score: {scored_captured[0][0]}): {download_url}")
                     
             if not download_url:
                 links = await page.query_selector_all("a")
+                found_links = []
                 for link in links:
                     text = (await link.inner_text()).lower()
                     href = await link.get_attribute("href")
                     if href and ("download" in text or "url?id=" in href or ".mkv" in href or ".mp4" in href):
-                        download_url = urljoin(page.url, href)
-                        break
+                        full_h = urljoin(page.url, href)
+                        score = get_quality_score(f"{text} {full_h}")
+                        found_links.append((score, full_h))
+                if found_links:
+                    found_links.sort(key=lambda x: x[0], reverse=True)
+                    download_url = found_links[0][1]
 
             if download_url:
                 print(f"[+] Forcing native browser navigation to bypass Cloudflare 403...")
@@ -364,7 +427,7 @@ async def try_animahd_scrape(query):
         print(f"[-] AnimaHD browser scraper error: {e}")
         return None
 
-# --- SOURCE 3: TELEGRAM BOTS FALLBACK ---
+# --- SOURCE 3: TELEGRAM BOTS FALLBACK (MULTI-RESOLUTION BUFFER) ---
 async def try_telegram_bots(query):
     print(f"\n[Source 3] Falling back to Telegram bots for: '{query}'...")
     try:
@@ -383,20 +446,31 @@ async def try_telegram_bots(query):
                 continue
 
             start_time = time.time()
-            target_media_msg = None
+            media_messages = []
 
-            while time.time() - start_time < 45:
-                async for msg in client.iter_messages(bot, min_id=out_id, limit=5):
-                    if msg.media or msg.document or msg.video:
-                        target_media_msg = msg
-                        break
-                if target_media_msg:
+            # Gather all response messages so we can pick 720p/1080p instead of grabbing 480p first
+            while time.time() - start_time < 40:
+                async for msg in client.iter_messages(bot, min_id=out_id, limit=15):
+                    if (msg.media or msg.document or msg.video) and msg.id not in [m.id for m in media_messages]:
+                        media_messages.append(msg)
+                if len(media_messages) >= 3 and (time.time() - start_time > 15):
                     break
                 await asyncio.sleep(3)
 
-            if target_media_msg:
-                f_name = getattr(target_media_msg.file, 'name', '') or "video.mp4"
-                dl_path = await target_media_msg.download_media(file=f"temp_{f_name}")
+            if media_messages:
+                scored_msgs = []
+                for m in media_messages:
+                    f_name = getattr(m.file, 'name', '') or ''
+                    caption = m.text or ''
+                    score = get_quality_score(f"{f_name} {caption}")
+                    scored_msgs.append((score, m, f_name))
+
+                scored_msgs.sort(key=lambda x: x[0], reverse=True)
+                best_score, best_msg, best_fname = scored_msgs[0]
+                print(f"[+] Selected Telegram media: '{best_fname}' (Quality Score: {best_score})")
+
+                final_name = best_fname or "video.mp4"
+                dl_path = await best_msg.download_media(file=f"temp_{final_name}")
                 await client.disconnect()
                 return dl_path
 
@@ -409,13 +483,17 @@ def transcode_and_upload(source_file, title_label):
     clean_title = sanitize_title(title_label)
     final_output = f"{clean_title}.mp4"
     
+    # -vf scale: Caps width to max 1920 (1080p), but preserves native 720p/1080p without upscaling
+    # -crf 22 + -preset veryfast: Delivers sharp, crisp visual quality instead of blurry ultrafast
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-i", source_file,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-vf", "scale='min(1920,iw)':-2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
         final_output
     ]
     
+    print(f"[*] Processing video with high-definition settings (Max 1080p, Min 720p clarity)...")
     proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
     upload_target = final_output if proc.returncode == 0 else source_file
     
@@ -426,8 +504,6 @@ def transcode_and_upload(source_file, title_label):
     print(f"[*] Uploading '{upload_target}' to Google Drive...")
     media = MediaFileUpload(upload_target, mimetype='video/mp4', resumable=True)
     
-    # --- THIS IS THE FIX ---
-    # Added num_retries=5 to automatically resume the upload if the network drops!
     uploaded_file = service.files().create(body=metadata, media_body=media, fields='id').execute(num_retries=5)
     file_id = uploaded_file.get('id')
     print(f"[+] Upload complete! File ID: {file_id}")
