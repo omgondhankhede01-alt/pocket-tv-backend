@@ -107,30 +107,47 @@ def decode_base64_string(encoded_str):
     except Exception:
         return None
 
-def resolve_gateway_url(url):
-    """Correctly splits and decodes AnimaHD sec_route & gateway parameters"""
+def resolve_gateway_url(url, session):
+    """Instantly unwraps sec_route and animesuki gateway redirection layers"""
     current_url = url
-    for _ in range(3):
+    for _ in range(5):
         parsed = urlparse(current_url)
         query_params = parse_qs(parsed.query)
         
+        # Layer 1: AnimaHD sec_route wrapper
         if "sec_route=1" in current_url and "p=" in current_url:
             try:
                 p_part = current_url.split("p=")[1].split("&")[0]
                 decoded = decode_base64_string(p_part)
                 if decoded:
-                    print(f"[+] Successfully decoded gateway wrapper -> {decoded}")
                     current_url = decoded
                     continue
             except Exception as e:
                 print(f"[-] Gateway split error: {e}")
                 
+        # Layer 2: Animesuki gateway target wrapper
         if "target=" in query_params:
             decoded = decode_base64_string(query_params["target"][0])
             if decoded:
-                print(f"[+] Successfully decoded target gateway -> {decoded}")
                 current_url = decoded
                 continue
+                
+        # If we hit an intermediate gateway page that requires clicking continue, fetch its HTML and look for form actions or redirect targets
+        if "animesuki.online" in parsed.netloc or "gate=" in current_url:
+            try:
+                r = session.get(current_url, timeout=10)
+                soup = BeautifulSoup(r.text, "html.parser")
+                # Look for target links embedded in scripts or buttons
+                found_next = False
+                for a in soup.find_all("a", href=True):
+                    if "target=" in a['href'] or "sec_route=1" in a['href']:
+                        current_url = urljoin(current_url, a['href'])
+                        found_next = True
+                        break
+                if found_next:
+                    continue
+            except Exception:
+                pass
         break
     return current_url
 
@@ -282,7 +299,8 @@ def try_animahd_scrape(query):
             print("[-] Episode link not found.")
             return None
             
-        resolved_page = resolve_gateway_url(target_ep_link)
+        # Resolve gateway loops using the session
+        resolved_page = resolve_gateway_url(target_ep_link, session)
         if "?" in resolved_page:
             resolved_page += "&passed=1"
         else:
