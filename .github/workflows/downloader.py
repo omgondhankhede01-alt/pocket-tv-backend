@@ -146,7 +146,7 @@ def try_filmyzilla_scrape(query):
         pass
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (NATIVE BROWSER DOWNLOADER) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (STREAM EXTRACTOR) ---
 async def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -201,7 +201,6 @@ async def try_animahd_scrape(query):
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            
             context = await browser.new_context(user_agent=HEADERS["User-Agent"], accept_downloads=True)
             page = await context.new_page()
             
@@ -266,70 +265,71 @@ async def try_animahd_scrape(query):
                 except Exception:
                     pass
             
-            # --- THE ULTIMATE FIX: FORCE NATIVE DOWNLOADING ---
             local_dl = "temp_animahd_stream.mkv"
             
-            # 1. Did the browser natively trigger a "Save As" download dialog from the button clicks?
+            # 1. Did the browser natively trigger a "Save As" download dialog?
             try:
                 download_obj = await asyncio.wait_for(asyncio.shield(download_future), timeout=8.0)
-                print(f"[+] Native browser download triggered by button! Saving to disk (Bypasses 403)...")
+                print(f"[+] Native browser download triggered by button! Saving to disk...")
                 await download_obj.save_as(local_dl)
                 await browser.close()
                 return local_dl
             except asyncio.TimeoutError:
                 pass
             
-            # 2. If no direct trigger, search our network interceptor for the hidden link
+            # 2. Search interceptor net for the workers.dev stream link
             for url in captured_urls:
                 if ".mkv" in url.lower() or ".mp4" in url.lower() or "workers.dev" in url.lower() or "download=true" in url.lower():
-                    download_url = url
-                    print(f"[+] Intercepted media request: {download_url}")
-                    break
-                    
-            if not download_url:
-                links = await page.query_selector_all("a")
-                for link in links:
-                    text = (await link.inner_text()).lower()
-                    href = await link.get_attribute("href")
-                    if href and ("download" in text or "url?id=" in href or ".mkv" in href or ".mp4" in href):
-                        download_url = urljoin(page.url, href)
+                    if "favicon" not in url.lower() and "google-analytics" not in url.lower():
+                        download_url = url
+                        print(f"[+] Intercepted media stream link: {download_url}")
                         break
 
             if download_url:
-                print(f"[+] Forcing native browser navigation to intercepted link to bypass Cloudflare 403...")
-                try:
-                    # Instruct the browser to literally open the download link instead of "fetching" it.
-                    # This natively mimics a human user and keeps all security headers intact.
-                    async with page.expect_download(timeout=120000) as download_info:
-                        try:
-                            await page.goto(download_url, timeout=30000)
-                        except Exception:
-                            pass # goto often throws an exception when a file download intercepts the navigation
-                            
-                    download = await download_info.value
-                    print("[+] Native download successfully intercepted! Saving to disk...")
-                    await download.save_as(local_dl)
-                    await browser.close()
-                    return local_dl
-                except Exception as e:
-                    print(f"[-] Native download check timed out. Verifying if it is an HTML page (like Google Drive)...")
+                print(f"[+] Ripping stream directly into memory (Bypassing Cloudflare 403 & Inline Players)...")
+                
+                # We MUST spoof the Referer to bypass Hotlink Protection on workers.dev
+                fetch_headers = {
+                    "User-Agent": HEADERS["User-Agent"],
+                    "Referer": page.url,
+                    "Accept": "*/*"
+                }
+                
+                # Fetch directly using Playwright's network stack so TLS fingerprints look 100% human
+                r_media = await context.request.get(download_url, headers=fetch_headers, timeout=300000)
+                
+                if r_media.ok:
+                    c_type = r_media.headers.get("content-type", "")
                     
-                    if "drive.google.com" in page.url:
-                        print("[*] Caught Google Drive Virus Scan warning! Clicking bypass...")
-                        try:
-                            form = await page.query_selector("form#download-form")
+                    if "text/html" in c_type:
+                        print("[-] Target returned HTML instead of video. Checking for Google Drive bypass...")
+                        pl_cookies = await context.cookies()
+                        session.headers.update(fetch_headers)
+                        for c in pl_cookies:
+                            session.cookies.set(c['name'], c['value'], domain=c['domain'], path=c['path'])
+                            
+                        r_html = session.get(download_url, allow_redirects=True)
+                        if "drive.google.com" in r_html.url:
+                            print("[*] Automatically bypassing Google Drive warning...")
+                            soup_drive = BeautifulSoup(r_html.text, "html.parser")
+                            form = soup_drive.find("form", id="download-form")
                             if form:
-                                async with page.expect_download(timeout=120000) as drive_dl_info:
-                                    await form.evaluate("form => form.submit()")
-                                drive_dl = await drive_dl_info.value
-                                print("[+] Google Drive bypass successful! Saving to disk...")
-                                await drive_dl.save_as(local_dl)
+                                confirm_url = urljoin(r_html.url, form.get("action"))
+                                r_media_req = session.get(confirm_url, stream=True, allow_redirects=True, timeout=60)
+                                with open(local_dl, "wb") as f:
+                                    for chunk in r_media_req.iter_content(chunk_size=1024*1024):
+                                        if chunk: f.write(chunk)
                                 await browser.close()
                                 return local_dl
-                        except Exception as drive_e:
-                            print(f"[-] Failed to bypass Google Drive: {drive_e}")
                     else:
-                        print(f"[-] Page resolved to: {page.url} - Could not locate video stream.")
+                        print("[+] Hotlink bypassed! Writing video buffer to disk...")
+                        body_bytes = await r_media.body()
+                        with open(local_dl, "wb") as f:
+                            f.write(body_bytes)
+                        await browser.close()
+                        return local_dl
+                else:
+                    print(f"[-] Chromium fetch failed with HTTP {r_media.status}")
 
             await browser.close()
         return None
