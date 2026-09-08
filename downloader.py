@@ -195,7 +195,7 @@ def try_filmyzilla_scrape(query):
 
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (3-STEP URL EXTRACTOR) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (DYNAMIC CHAIN SOLVER) ---
 def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -252,49 +252,71 @@ def try_animahd_scrape(query):
             target_ep_link = episode_links[0][1]
             
         if not target_ep_link:
-            print("[-] Episode player link not found on series page.")
+            print("[-] Episode link not found on series page.")
             return None
             
         # =========================================================
-        # THE 3-STEP URL EXTRACTION PIPELINE
+        # DYNAMIC CHAIN SOLVER (HANDLES ALL NESTED LAYERS)
         # =========================================================
+        current_url = target_ep_link
+        print(f"[*] Initiating link unwrapping chain...")
         
-        # STEP 1: Fetch the initial player page
-        print(f"[*] Step 1 -> Visiting Initial Player Link: {target_ep_link}")
-        r_player = session.get(target_ep_link, timeout=15)
-        
-        # STEP 2: Extract the Animesuki Gateway Link from the HTML source
-        gateway_url = None
-        gw_match = re.search(r'(https?://[^"\'\s<>]+(?:animesuki\.online|target=|sec_route=1)[^"\'\s<>]+)', r_player.text)
-        
-        if gw_match:
-            gateway_url = gw_match.group(1).replace("&amp;", "&")
-            print(f"[*] Step 2 -> Extracted Gateway Link: {gateway_url}")
-        else:
-            print("[-] Could not find the Gateway Link (animesuki.online) in the player page source.")
-            return None
+        for step in range(1, 7):
+            print(f"[*] Chain Step {step}: {current_url}")
             
-        # STEP 3: Decode the Base64 Target to find the DiscoverNewAnime Destination
-        parsed = urlparse(gateway_url)
-        q_params = parse_qs(parsed.query)
-        
-        final_dest = None
-        if "target" in q_params:
-            final_dest = decode_base64_string(q_params["target"][0])
-        elif "p" in q_params:
-            final_dest = decode_base64_string(q_params["p"][0])
+            # Case A: Base64 'p=' parameter (sec_route wrapper)
+            if "sec_route=1" in current_url and "p=" in current_url:
+                try:
+                    p_val = current_url.split("p=")[1].split("&")[0]
+                    decoded = decode_base64_string(p_val)
+                    if decoded:
+                        print(f"[+] -> Decoded sec_route wrapper.")
+                        current_url = decoded
+                        continue
+                except Exception:
+                    pass
+
+            # Case B: Base64 'target=' parameter (animesuki gateway)
+            elif "target=" in current_url:
+                try:
+                    t_val = current_url.split("target=")[1].split("&")[0]
+                    decoded = decode_base64_string(t_val)
+                    if decoded:
+                        print(f"[+] -> Decoded gateway target.")
+                        current_url = decoded
+                        continue
+                except Exception:
+                    pass
+                
+            # Case C: Player page requiring HTML scrape
+            elif "player" in current_url or "file_id=" in current_url:
+                try:
+                    r_player = session.get(current_url, timeout=15)
+                    gw_match = re.search(r'(https?://[^"\'\s<>]+(?:animesuki\.online|target=|sec_route=1)[^"\'\s<>]+)', r_player.text)
+                    if gw_match:
+                        current_url = gw_match.group(1).replace("&amp;", "&")
+                        print(f"[+] -> Extracted hidden JS gateway.")
+                        continue
+                except Exception:
+                    pass
+                
+            # Case D: Reached final media host!
+            elif "eid=" in current_url or "animahd.online" in current_url:
+                print(f"[+] -> Reached final media host!")
+                break
             
-        if not final_dest:
-            print("[-] Could not decode base64 target from gateway link.")
-            return None
-            
-        # Add the authentication parameter
+            else:
+                print("[-] Unknown link type in chain, stopping.")
+                break
+                
+        final_dest = current_url
         if "?" in final_dest:
-            final_dest += "&passed=1"
+            if "passed=1" not in final_dest:
+                final_dest += "&passed=1"
         else:
             final_dest += "?passed=1"
             
-        print(f"[*] Step 3 -> Final Target Destination: {final_dest}")
+        print(f"[*] Final Target Destination: {final_dest}")
         
         # =========================================================
         # FETCH FINAL DESTINATION & DOWNLOAD
