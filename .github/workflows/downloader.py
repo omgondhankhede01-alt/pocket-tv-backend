@@ -9,7 +9,7 @@ import requests
 import base64
 import unicodedata
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, urlparse, parse_qs
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from google.oauth2.credentials import Credentials
@@ -90,7 +90,7 @@ def decode_base64_string(encoded_str):
         encoded_str = encoded_str.replace('-', '+').replace('_', '/')
         encoded_str += "=" * ((4 - len(encoded_str) % 4) % 4)
         return base64.b64decode(encoded_str).decode('utf-8')
-    except Exception as e:
+    except Exception:
         return None
 
 # --- SOURCE 1: FILMYZILLA SCRAPER ---
@@ -146,7 +146,7 @@ def try_filmyzilla_scrape(query):
         pass
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (COOKIE SYNC & DRIVE BYPASS) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (COOKIE SYNC, TELEPORT & 3-STEP CLICKER) ---
 async def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -204,7 +204,7 @@ async def try_animahd_scrape(query):
             context = await browser.new_context(user_agent=HEADERS["User-Agent"])
             page = await context.new_page()
             
-            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
+            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font"] else route.continue_())
             page.on("popup", lambda popup: asyncio.create_task(popup.close()))
 
             print(f"[*] Browser loading Player Link: {target_ep_link}")
@@ -240,22 +240,30 @@ async def try_animahd_scrape(query):
                     await page.goto(final_url, timeout=20000)
                 except Exception:
                     pass
-            else:
-                print("[-] Target not in URL. Falling back to aggressive button mashing...")
-                for _ in range(15): 
-                    if "eid=" in page.url or "animahd.online" in page.url:
-                        break
-                    try:
-                        btn = page.locator("a, button").filter(has_text=re.compile(r"Continue|Go To Destination", re.IGNORECASE)).first
-                        if await btn.is_visible(timeout=1000):
-                            await btn.click(force=True) 
-                    except Exception:
-                        pass
-                    await page.wait_for_timeout(1000)
             
             final_url = page.url
             print(f"[+] Final Reached Host: {final_url}")
             
+            # --- THE MAGIC FIX: 3-STEP BUTTON CLICKER ---
+            print("[*] Executing multi-step JS button sequence...")
+            click_sequence = [
+                r"Download Episode",
+                r"Click Again to Continue",
+                r"Final Step"
+            ]
+            
+            for step_regex in click_sequence:
+                try:
+                    # Look for any element matching the text regex
+                    btn = page.get_by_text(re.compile(step_regex, re.IGNORECASE)).first
+                    if await btn.is_visible(timeout=5000):
+                        print(f"[+] Human Sim: Clicking '{step_regex}'")
+                        await btn.click(force=True)
+                        await page.wait_for_timeout(3500) # Give JS time to change the button state
+                except Exception:
+                    pass
+            
+            # After clicking all the buttons, look for the actual download href
             links = await page.query_selector_all("a")
             for link in links:
                 text = (await link.inner_text()).lower()
@@ -264,7 +272,6 @@ async def try_animahd_scrape(query):
                     download_url = urljoin(page.url, href)
                     break
             
-            # --- MAGIC FIX: TRANSFER BROWSER COOKIES TO REQUESTS ---
             pl_cookies = await context.cookies()
             await browser.close()
             
@@ -276,14 +283,12 @@ async def try_animahd_scrape(query):
         local_dl = "temp_animahd_stream.mkv"
         session.headers.update({"Referer": final_url})
         
-        # Inject Playwright cookies so the server thinks we are the same verified human
         for c in pl_cookies:
             session.cookies.set(c['name'], c['value'], domain=c['domain'], path=c['path'])
             
         r_media = session.get(download_url, stream=True, allow_redirects=True, timeout=25)
         r_media.raise_for_status()
         
-        # --- MAGIC FIX 2: HANDLE GOOGLE DRIVE VIRUS WARNINGS & JUNK HTML ---
         content_type = r_media.headers.get("Content-Type", "")
         if "text/html" in content_type:
             if "drive.google.com" in r_media.url:
