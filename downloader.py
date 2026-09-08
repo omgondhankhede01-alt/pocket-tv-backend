@@ -163,9 +163,25 @@ async def try_animahd_scrape(query):
         if r.status_code != 200: return None
         soup = BeautifulSoup(r.text, "html.parser")
         
-        anime_page_url = next((a['href'] for a in soup.find_all("a", href=True) if clean_text(base_title) in clean_text(a.get_text()) and ANIMAHD_DOMAIN in a['href']), None)
+        # --- THE NAV-BAR BYPASS FIX ---
+        # Ignore site utility links so it doesn't accidentally grab the "Filter" menu
+        ignore_links = ["/filter/", "/anime-schedule/", "/dmca/", "/terms/", "/about/", "/contact/"]
+        
+        anime_page_url = None
+        for a in soup.find_all("a", href=True):
+            href = a['href']
+            if ANIMAHD_DOMAIN in href and not any(ig in href.lower() for ig in ignore_links) and href.strip('/') != ANIMAHD_DOMAIN.strip('/'):
+                if clean_text(base_title) in clean_text(a.get_text()):
+                    anime_page_url = href
+                    break
+                    
+        # If exact title match fails (due to long names/punctuation), take the first valid result link
         if not anime_page_url:
-            anime_page_url = next((a['href'] for a in soup.find_all("a", href=True) if ANIMAHD_DOMAIN in a['href'] and a['href'] != ANIMAHD_DOMAIN + "/"), None)
+            for a in soup.find_all("a", href=True):
+                href = a['href']
+                if ANIMAHD_DOMAIN in href and not any(ig in href.lower() for ig in ignore_links) and href.strip('/') != ANIMAHD_DOMAIN.strip('/'):
+                    anime_page_url = href
+                    break
             
         if not anime_page_url:
             print("[-] Series page not found on AnimaHD.")
@@ -205,7 +221,6 @@ async def try_animahd_scrape(query):
             context = await browser.new_context(user_agent=HEADERS["User-Agent"], accept_downloads=True)
             page = await context.new_page()
             
-            # Setup GLOBAL native download listener for ALL tabs/popups
             loop = asyncio.get_running_loop()
             download_future = loop.create_future()
             
@@ -216,11 +231,8 @@ async def try_animahd_scrape(query):
             page.on("download", _on_download)
             context.on("page", lambda new_page: new_page.on("download", _on_download))
             
-            # Block ONLY images and fonts. Do NOT close popups.
             await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font"] else route.continue_())
-            
-            # Capture network requests across the ENTIRE browser context, including popups
-            context.on("request", lambda req: captured_urls.append(req.url))
+            page.on("request", lambda req: captured_urls.append(req.url))
 
             print(f"[*] Browser loading Player Link: {target_ep_link}")
             try:
@@ -277,7 +289,6 @@ async def try_animahd_scrape(query):
             
             local_dl = "temp_animahd_stream.mkv"
             
-            # 1. Did the browser natively trigger a download from the button clicks?
             try:
                 download_obj = await asyncio.wait_for(asyncio.shield(download_future), timeout=15.0)
                 print(f"[+] Native browser download triggered! Saving to disk (Bypasses 403)...")
@@ -287,10 +298,8 @@ async def try_animahd_scrape(query):
             except asyncio.TimeoutError:
                 print("[-] No immediate native download detected. Searching network interceptor logs...")
             
-            # 2. Search our network interceptor for the hidden link
             for url in captured_urls:
                 if re.search(r'\.mkv|\.mp4|workers\.dev|download=true', url, re.IGNORECASE):
-                    # Ensure we don't accidentally grab the main HTML page
                     if url != page.url and "latestanimeepisodes" not in url:
                         download_url = url
                         print(f"[+] Intercepted media request: {download_url}")
@@ -308,8 +317,6 @@ async def try_animahd_scrape(query):
             if download_url:
                 print(f"[+] Forcing native browser navigation to bypass Cloudflare 403...")
                 try:
-                    # Instruct the browser to literally open the download link via JS
-                    # This natively mimics a human user and keeps all security headers intact.
                     async with page.expect_download(timeout=90000) as dl_info:
                         try:
                             await page.evaluate("url => window.location.href = url", download_url)
@@ -324,7 +331,6 @@ async def try_animahd_scrape(query):
                 except Exception:
                     print(f"[-] Native download check timed out. Verifying if it is an HTML page (like Google Drive)...")
                     
-                    # Ensure we check both the main tab and any new pop-up tabs for the Google Drive warning
                     active_pages = context.pages
                     drive_page = None
                     for p_tab in active_pages:
@@ -359,8 +365,14 @@ async def try_animahd_scrape(query):
 async def try_telegram_bots(query):
     print(f"\n[Source 3] Falling back to Telegram bots for: '{query}'...")
     try:
+        # Note: If your session string was revoked, you must generate a new one!
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
         await client.connect()
+        
+        # Check if authorized - if not, the session was banned
+        if not await client.is_user_authorized():
+            print("[-] Telegram session is invalid or revoked. Please generate a new TG_SESSION string.")
+            return None
 
         for bot in ACTIVE_BOTS:
             try:
