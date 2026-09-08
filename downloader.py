@@ -24,6 +24,7 @@ API_ID = 32183183
 API_HASH = "198b328ce18f36d0ee8e69f1256d7a16"
 SESSION_STRING = os.environ.get("TG_SESSION", "")
 MOVIE_NAME = os.environ.get("MOVIE_NAME", "").strip()
+RUN_MODE = os.environ.get("RUN_MODE", "all").strip().lower()
 
 ACTIVE_BOTS = [
     "@kevinhartrobot",
@@ -37,6 +38,15 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+def set_github_output(name, value):
+    output_file = os.environ.get("GITHUB_OUTPUT")
+    if output_file:
+        try:
+            with open(output_file, "a", encoding="utf-8") as f:
+                f.write(f"{name}={value}\n")
+        except Exception:
+            pass
 
 def clean_text(text):
     return re.sub(r'[^a-zA-Z0-9\s]', '', text).lower().strip()
@@ -60,15 +70,6 @@ def sanitize_title(title):
         return clean.title()
 
 def get_quality_score(text):
-    """
-    Calculates priority score to strictly enforce Min 720p, Max 1080p:
-    1080p -> 100
-    720p  -> 90
-    HD (unspecified 720/1080) -> 80
-    Unknown / unstated -> 40
-    2160p / 4K -> -50 (exceeds max 1080p constraint)
-    480p / 360p / 240p / CAM -> -100 (below min 720p constraint)
-    """
     t = str(text).lower()
     if re.search(r'\b(1080p|1080|fhd|full\s*hd)\b', t):
         return 100
@@ -120,7 +121,7 @@ def decode_base64_string(encoded_str):
     except Exception:
         return None
 
-# --- SOURCE 1: FILMYZILLA SCRAPER (QUALITY AWARE) ---
+# --- SOURCE 1: FILMYZILLA SCRAPER ---
 def try_filmyzilla_scrape(query):
     print(f"\n[Source 1] Searching Filmyzilla for: '{query}'...")
     session = requests.Session()
@@ -145,7 +146,6 @@ def try_filmyzilla_scrape(query):
             candidates.append((score, txt, href))
 
     if not candidates: return None
-    # Sort candidates by resolution quality (1080p > 720p > others, 480p pushed to bottom)
     candidates.sort(key=lambda x: x[0], reverse=True)
     target_page = candidates[0][2]
     
@@ -193,7 +193,7 @@ def try_filmyzilla_scrape(query):
         pass
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (QUALITY AWARE) ---
+# --- SOURCE 2: ANIMAHd SCRAPER ---
 async def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -339,7 +339,7 @@ async def try_animahd_scrape(query):
                     if await btn.is_visible(timeout=8000):
                         print(f"[+] Human Sim: Clicking '{step_regex}'")
                         await btn.click(force=True)
-                        await page.wait_for_timeout(4000)
+                        await page.wait_for_timeout(2000)
                 except Exception:
                     pass
             
@@ -427,15 +427,16 @@ async def try_animahd_scrape(query):
         print(f"[-] AnimaHD browser scraper error: {e}")
         return None
 
-# --- SOURCE 3: TELEGRAM BOTS FALLBACK (MULTI-RESOLUTION BUFFER) ---
+# --- SOURCE 3: TELEGRAM BOTS FALLBACK ---
 async def try_telegram_bots(query):
-    print(f"\n[Source 3] Falling back to Telegram bots for: '{query}'...")
+    print(f"\n[Source 3] Engaging Telegram bots fallback for: '{query}'...")
+    client = None
     try:
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
         await client.connect()
         
         if not await client.is_user_authorized():
-            print("[-] Telegram session is invalid or revoked. Please generate a new TG_SESSION string.")
+            print("[-] Telegram session is invalid or revoked. Please update TG_SESSION.")
             return None
 
         for bot in ACTIVE_BOTS:
@@ -448,14 +449,19 @@ async def try_telegram_bots(query):
             start_time = time.time()
             media_messages = []
 
-            # Gather all response messages so we can pick 720p/1080p instead of grabbing 480p first
-            while time.time() - start_time < 40:
+            while time.time() - start_time < 25: 
                 async for msg in client.iter_messages(bot, min_id=out_id, limit=15):
                     if (msg.media or msg.document or msg.video) and msg.id not in [m.id for m in media_messages]:
                         media_messages.append(msg)
-                if len(media_messages) >= 3 and (time.time() - start_time > 15):
+                
+                if media_messages:
+                    best_current_score = max([get_quality_score(f"{getattr(m.file, 'name', '')} {m.text or ''}") for m in media_messages])
+                    if best_current_score >= 90:
+                        break
+                        
+                if len(media_messages) >= 3 and (time.time() - start_time > 8):
                     break
-                await asyncio.sleep(3)
+                await asyncio.sleep(1)
 
             if media_messages:
                 scored_msgs = []
@@ -471,31 +477,83 @@ async def try_telegram_bots(query):
 
                 final_name = best_fname or "video.mp4"
                 dl_path = await best_msg.download_media(file=f"temp_{final_name}")
-                await client.disconnect()
                 return dl_path
 
-        await client.disconnect()
     except Exception as e:
-        print(f"[-] Telegram bots fallback skipped: {e}")
+        print(f"[-] Telegram bots error: {e}")
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
+            print("[*] Disconnected cleanly from Telegram session.")
     return None
+
+def probe_file_streams(filepath):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "stream=codec_type,codec_name,pix_fmt",
+        "-of", "json", filepath
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        info = json.loads(proc.stdout)
+        video_codec = None
+        pix_fmt = None
+        audio_codec = None
+        
+        for s in info.get("streams", []):
+            c_type = s.get("codec_type")
+            if c_type == "video" and not video_codec:
+                video_codec = s.get("codec_name", "").lower()
+                pix_fmt = s.get("pix_fmt", "").lower()
+            elif c_type == "audio" and not audio_codec:
+                audio_codec = s.get("codec_name", "").lower()
+                
+        return video_codec, pix_fmt, audio_codec
+    except Exception as e:
+        print(f"[-] ffprobe inspection error: {e}")
+        return None, None, None
 
 def transcode_and_upload(source_file, title_label):
     clean_title = sanitize_title(title_label)
     final_output = f"{clean_title}.mp4"
     
-    # -vf scale: Caps width to max 1920 (1080p), but preserves native 720p/1080p without upscaling
-    # -crf 22 + -preset veryfast: Delivers sharp, crisp visual quality instead of blurry ultrafast
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-i", source_file,
-        "-vf", "scale='min(1920,iw)':-2",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
-        final_output
-    ]
+    v_codec, pix_fmt, a_codec = probe_file_streams(source_file)
+    print(f"[*] Detected streams: Video={v_codec} ({pix_fmt}), Audio={a_codec}")
     
-    print(f"[*] Processing video with high-definition settings (Max 1080p, Min 720p clarity)...")
+    is_v_safe = (v_codec == "h264") and (pix_fmt == "yuv420p")
+    is_a_safe = a_codec in ["aac", "mp3", "ac3"]
+    
+    if is_v_safe and is_a_safe:
+        print("[+] File is 100% compatible with old TVs. Remuxing instantly (stream copy)...")
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", source_file,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            final_output
+        ]
+    elif is_v_safe and not is_a_safe:
+        print("[*] Video is compatible, but audio is incompatible. Copying video & converting audio to AAC...")
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", source_file,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            final_output
+        ]
+    else:
+        print("[!] Video is HEVC/10-bit. Transcoding to 8-bit H.264 Level 4.1 for old TV compatibility...")
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", source_file,
+            "-vf", "scale='min(1920,iw)':-2",
+            "-c:v", "libx264", "-profile:v", "high", "-level", "4.1",
+            "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            final_output
+        ]
+    
     proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-    upload_target = final_output if proc.returncode == 0 else source_file
+    upload_target = final_output if proc.returncode == 0 and os.path.exists(final_output) else source_file
     
     service = get_drive_service()
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
@@ -521,17 +579,33 @@ async def main():
     if not MOVIE_NAME:
         sys.exit(1)
 
-    downloaded = try_filmyzilla_scrape(MOVIE_NAME)
-    if not downloaded:
-        downloaded = await try_animahd_scrape(MOVIE_NAME)
-    if not downloaded:
+    downloaded = None
+
+    # Step 1: Execute Web Scrapers (if mode is 'web' or 'all')
+    if RUN_MODE in ["web", "all"]:
+        downloaded = try_filmyzilla_scrape(MOVIE_NAME)
+        if not downloaded:
+            downloaded = await try_animahd_scrape(MOVIE_NAME)
+
+    # Step 2: Execute Telegram Fallback (if mode is 'telegram' or 'all' with fallback)
+    if not downloaded and RUN_MODE in ["telegram", "all"]:
         downloaded = await try_telegram_bots(MOVIE_NAME)
 
+    # Process and Report Results
     if downloaded:
         transcode_and_upload(downloaded, MOVIE_NAME)
         sync_movies_json()
+        set_github_output("downloaded", "true")
+        print("[+] Download and sync completed successfully.")
+        sys.exit(0)
     else:
-        sys.exit(1)
+        set_github_output("downloaded", "false")
+        if RUN_MODE == "web":
+            print("[*] Web scrapers could not find the file. Handing off to sequential Telegram fallback...")
+            sys.exit(0)
+        else:
+            print("[-] All sources exhausted. File could not be retrieved.")
+            sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
