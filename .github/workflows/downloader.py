@@ -9,7 +9,7 @@ import requests
 import base64
 import unicodedata
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote, parse_qs, urlparse
+from urllib.parse import urljoin, quote
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from google.oauth2.credentials import Credentials
@@ -77,7 +77,6 @@ def sync_movies_json():
     print("[*] movies.json synced successfully.")
 
 def install_browser_engine():
-    """Dynamically installs Playwright so the script can act like a human user."""
     try:
         import playwright
     except ImportError:
@@ -147,7 +146,7 @@ def try_filmyzilla_scrape(query):
         pass
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER (POPUP KILLER & TELEPORT BYPASS) ---
+# --- SOURCE 2: ANIMAHd SCRAPER (COOKIE SYNC & DRIVE BYPASS) ---
 async def try_animahd_scrape(query):
     print(f"\n[Source 2] Searching AnimaHD for: '{query}'...")
     session = requests.Session()
@@ -198,16 +197,14 @@ async def try_animahd_scrape(query):
         
         download_url = None
         final_url = None
+        pl_cookies = []
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
             context = await browser.new_context(user_agent=HEADERS["User-Agent"])
             page = await context.new_page()
             
-            # 1. Block images/fonts for raw speed
             await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
-
-            # 2. INSTANT POPUP KILLER - Automatically closes any ad tabs the site tries to spawn
             page.on("popup", lambda popup: asyncio.create_task(popup.close()))
 
             print(f"[*] Browser loading Player Link: {target_ep_link}")
@@ -225,7 +222,6 @@ async def try_animahd_scrape(query):
             current_url = page.url
             print(f"[+] Reached Gateway: {current_url}")
             
-            # THE MAGIC TRICK: Read the destination straight out of the URL bar
             if "target=" in current_url:
                 print("[*] Target found in URL! Skipping countdowns and ads...")
                 parsed = urlparse(current_url)
@@ -245,22 +241,21 @@ async def try_animahd_scrape(query):
                 except Exception:
                     pass
             else:
-                # FALLBACK: If target isn't in the URL, violently click buttons while ignoring ad popups
                 print("[-] Target not in URL. Falling back to aggressive button mashing...")
-                for _ in range(15): # Hammer it for ~15 seconds
+                for _ in range(15): 
                     if "eid=" in page.url or "animahd.online" in page.url:
                         break
                     try:
                         btn = page.locator("a, button").filter(has_text=re.compile(r"Continue|Go To Destination", re.IGNORECASE)).first
                         if await btn.is_visible(timeout=1000):
-                            await btn.click(force=True) # Force click ignores overlays!
+                            await btn.click(force=True) 
                     except Exception:
                         pass
                     await page.wait_for_timeout(1000)
             
-            print(f"[+] Final Host Loaded: {page.url}")
+            final_url = page.url
+            print(f"[+] Final Reached Host: {final_url}")
             
-            # Extract download button
             links = await page.query_selector_all("a")
             for link in links:
                 text = (await link.inner_text()).lower()
@@ -268,7 +263,9 @@ async def try_animahd_scrape(query):
                 if href and ("download" in text or "url?id=" in href or ".mkv" in href or ".mp4" in href):
                     download_url = urljoin(page.url, href)
                     break
-                    
+            
+            # --- MAGIC FIX: TRANSFER BROWSER COOKIES TO REQUESTS ---
+            pl_cookies = await context.cookies()
             await browser.close()
             
         if not download_url:
@@ -277,12 +274,36 @@ async def try_animahd_scrape(query):
             
         print(f"[+] Extracting file directly from: {download_url}")
         local_dl = "temp_animahd_stream.mkv"
-        session.headers.update({"Referer": final_url or page.url})
-        with session.get(download_url, stream=True, allow_redirects=True, timeout=25) as res:
-            res.raise_for_status()
-            with open(local_dl, "wb") as f:
-                for chunk in res.iter_content(chunk_size=1024*1024):
-                    if chunk: f.write(chunk)
+        session.headers.update({"Referer": final_url})
+        
+        # Inject Playwright cookies so the server thinks we are the same verified human
+        for c in pl_cookies:
+            session.cookies.set(c['name'], c['value'], domain=c['domain'], path=c['path'])
+            
+        r_media = session.get(download_url, stream=True, allow_redirects=True, timeout=25)
+        r_media.raise_for_status()
+        
+        # --- MAGIC FIX 2: HANDLE GOOGLE DRIVE VIRUS WARNINGS & JUNK HTML ---
+        content_type = r_media.headers.get("Content-Type", "")
+        if "text/html" in content_type:
+            if "drive.google.com" in r_media.url:
+                print("[*] Caught Google Drive Virus Scan warning! Automatically bypassing...")
+                soup_drive = BeautifulSoup(r_media.text, "html.parser")
+                form = soup_drive.find("form", id="download-form")
+                if form:
+                    confirm_url = urljoin(r_media.url, form.get("action"))
+                    print(f"[+] Found bypass URL: {confirm_url}")
+                    r_media = session.get(confirm_url, stream=True, allow_redirects=True, timeout=25)
+                    r_media.raise_for_status()
+                else:
+                    print("[-] Could not find the bypass form on the Google Drive page.")
+            else:
+                print("[-] WARNING: The destination returned an HTML page instead of a video! It might be a firewall block.")
+                print(f"[-] Final Stream URL: {r_media.url}")
+        
+        with open(local_dl, "wb") as f:
+            for chunk in r_media.iter_content(chunk_size=1024*1024):
+                if chunk: f.write(chunk)
                     
         return local_dl
 
