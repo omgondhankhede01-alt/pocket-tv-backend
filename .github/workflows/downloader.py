@@ -44,11 +44,14 @@ def sanitize_title(title):
     e_match = re.search(r'\b(?:e|ep|episode)\s*(\d{1,2})\b', clean, re.IGNORECASE)
     
     if se_match:
-        return f"{re.sub(r'\b(?:s|season)\s*\d{1,2}\s*(?:e|ep|episode)\s*\d{1,2}\b', '', clean, flags=re.IGNORECASE).strip().title()} S{int(se_match.group(1)):02d}E{int(se_match.group(2)):02d}"
+        base = re.sub(r'\b(?:s|season)\s*\d{1,2}\s*(?:e|ep|episode)\s*\d{1,2}\b', '', clean, flags=re.IGNORECASE).strip()
+        return f"{base.title()} S{int(se_match.group(1)):02d}E{int(se_match.group(2)):02d}"
     elif es_match:
-        return f"{re.sub(r'\b(?:e|ep|episode)\s*\d{1,2}\s*(?:s|season)\s*\d{1,2}\b', '', clean, flags=re.IGNORECASE).strip().title()} S{int(es_match.group(2)):02d}E{int(es_match.group(1)):02d}"
+        base = re.sub(r'\b(?:e|ep|episode)\s*\d{1,2}\s*(?:s|season)\s*\d{1,2}\b', '', clean, flags=re.IGNORECASE).strip()
+        return f"{base.title()} S{int(es_match.group(2)):02d}E{int(es_match.group(1)):02d}"
     elif e_match:
-        return f"{re.sub(r'\b(?:e|ep|episode)\s*\d{1,2}\b', '', clean, flags=re.IGNORECASE).strip().title()} S01E{int(e_match.group(1)):02d}"
+        base = re.sub(r'\b(?:e|ep|episode)\s*\d{1,2}\b', '', clean, flags=re.IGNORECASE).strip()
+        return f"{base.title()} S01E{int(e_match.group(1)):02d}"
     else:
         return clean.title()
 
@@ -334,10 +337,8 @@ async def main():
     if not MOVIE_NAME:
         sys.exit(1)
 
-    # Note: Filmyzilla is completely static and fast, so we keep it sync
     downloaded = try_filmyzilla_scrape(MOVIE_NAME)
     if not downloaded:
-        # AnimaHD now triggers the async human-browser simulation
         downloaded = await try_animahd_scrape(MOVIE_NAME)
     if not downloaded:
         downloaded = await try_telegram_bots(MOVIE_NAME)
