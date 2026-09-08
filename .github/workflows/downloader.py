@@ -108,46 +108,69 @@ def decode_base64_string(encoded_str):
         return None
 
 def resolve_gateway_url(url, session):
-    """Instantly unwraps sec_route and animesuki gateway redirection layers"""
+    """Deeply parses JS redirects, base64 p= parameters, and gateway targets"""
     current_url = url
-    for _ in range(5):
+    for _ in range(6):
         parsed = urlparse(current_url)
         query_params = parse_qs(parsed.query)
         
-        # Layer 1: AnimaHD sec_route wrapper
-        if "sec_route=1" in current_url and "p=" in current_url:
+        # 1. Handle base64 'p=' parameters
+        if "p=" in query_params:
             try:
-                p_part = current_url.split("p=")[1].split("&")[0]
+                p_part = query_params["p"][0].split("&")[0]
                 decoded = decode_base64_string(p_part)
                 if decoded:
                     current_url = decoded
                     continue
-            except Exception as e:
-                print(f"[-] Gateway split error: {e}")
+            except Exception:
+                pass
                 
-        # Layer 2: Animesuki gateway target wrapper
+        # 2. Handle base64 'target=' parameters
         if "target=" in query_params:
-            decoded = decode_base64_string(query_params["target"][0])
-            if decoded:
-                current_url = decoded
-                continue
-                
-        # If we hit an intermediate gateway page that requires clicking continue, fetch its HTML and look for form actions or redirect targets
-        if "animesuki.online" in parsed.netloc or "gate=" in current_url:
             try:
-                r = session.get(current_url, timeout=10)
-                soup = BeautifulSoup(r.text, "html.parser")
-                # Look for target links embedded in scripts or buttons
-                found_next = False
-                for a in soup.find_all("a", href=True):
-                    if "target=" in a['href'] or "sec_route=1" in a['href']:
-                        current_url = urljoin(current_url, a['href'])
-                        found_next = True
-                        break
-                if found_next:
+                target_part = query_params["target"][0].split("&")[0]
+                decoded = decode_base64_string(target_part)
+                if decoded:
+                    current_url = decoded
                     continue
             except Exception:
                 pass
+                
+        # 3. Fetch page and extract JS/HTML redirect targets if stuck on a gateway or player page
+        try:
+            r = session.get(current_url, timeout=12, allow_redirects=True)
+            soup = BeautifulSoup(r.text, "html.parser")
+            
+            # Search script tags for window.location or redirection links
+            redirect_found = False
+            for script in soup.find_all("script"):
+                script_text = script.string or ""
+                matches = re.findall(r'https?://[^\s\'"]+', script_text)
+                for candidate in matches:
+                    if "animesuki.online" in candidate or "animahd.online" in candidate or "target=" in candidate or "sec_route=1" in candidate:
+                        current_url = candidate
+                        redirect_found = True
+                        break
+                if redirect_found:
+                    break
+                    
+            if redirect_found:
+                continue
+                
+            # Search anchor links on gateway interstitial pages (like "Continue" or "Go To Destination")
+            for a in soup.find_all("a", href=True):
+                href = a['href']
+                if "animesuki.online" in href or "target=" in href or "sec_route=1" in href or "passed=1" in href:
+                    current_url = urljoin(r.url, href)
+                    redirect_found = True
+                    break
+                    
+            if redirect_found:
+                continue
+                
+        except Exception as e:
+            print(f"[-] Gateway loop error: {e}")
+            
         break
     return current_url
 
@@ -299,7 +322,7 @@ def try_animahd_scrape(query):
             print("[-] Episode link not found.")
             return None
             
-        # Resolve gateway loops using the session
+        # Resolve gateway loops using JS parser
         resolved_page = resolve_gateway_url(target_ep_link, session)
         if "?" in resolved_page:
             resolved_page += "&passed=1"
@@ -342,35 +365,38 @@ def try_animahd_scrape(query):
 # --- SOURCE 3: TELEGRAM BOTS FALLBACK ---
 async def try_telegram_bots(query):
     print(f"\n[Source 3] Falling back to Telegram bots for: '{query}'...")
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    await client.connect()
+    try:
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        await client.connect()
 
-    for bot in ACTIVE_BOTS:
-        try:
-            sent_msg = await client.send_message(bot, query)
-            out_id = sent_msg.id
-        except Exception:
-            continue
+        for bot in ACTIVE_BOTS:
+            try:
+                sent_msg = await client.send_message(bot, query)
+                out_id = sent_msg.id
+            except Exception:
+                continue
 
-        start_time = time.time()
-        target_media_msg = None
+            start_time = time.time()
+            target_media_msg = None
 
-        while time.time() - start_time < 45:
-            async for msg in client.iter_messages(bot, min_id=out_id, limit=5):
-                if msg.media or msg.document or msg.video:
-                    target_media_msg = msg
+            while time.time() - start_time < 45:
+                async for msg in client.iter_messages(bot, min_id=out_id, limit=5):
+                    if msg.media or msg.document or msg.video:
+                        target_media_msg = msg
+                        break
+                if target_media_msg:
                     break
+                await asyncio.sleep(3)
+
             if target_media_msg:
-                break
-            await asyncio.sleep(3)
+                f_name = getattr(target_media_msg.file, 'name', '') or "video.mp4"
+                dl_path = await target_media_msg.download_media(file=f"temp_{f_name}")
+                await client.disconnect()
+                return dl_path
 
-        if target_media_msg:
-            f_name = getattr(target_media_msg.file, 'name', '') or "video.mp4"
-            dl_path = await target_media_msg.download_media(file=f"temp_{f_name}")
-            await client.disconnect()
-            return dl_path
-
-    await client.disconnect()
+        await client.disconnect()
+    except Exception as e:
+        print(f"[-] Telegram bots fallback skipped due to network/auth limits: {e}")
     return None
 
 def transcode_and_upload(source_file, title_label):
