@@ -8,6 +8,7 @@ import subprocess
 import requests
 import base64
 import unicodedata
+import socket
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote, urlparse, parse_qs
 from telethon import TelegramClient
@@ -15,6 +16,9 @@ from telethon.sessions import StringSession
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+
+# Increase global timeout for massive file uploads to prevent TimeoutError
+socket.setdefaulttimeout(300)
 
 API_ID = 32183183
 API_HASH = "198b328ce18f36d0ee8e69f1256d7a16"
@@ -69,7 +73,9 @@ def sync_movies_json():
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
     service = get_drive_service()
     query = f"'{folder_id}' in parents and trashed = false"
-    results = service.files().list(q=query, pageSize=200, fields="files(id, name, webViewLink, webContentLink)").execute()
+    
+    # Added num_retries here to prevent timeouts during sync
+    results = service.files().list(q=query, pageSize=200, fields="files(id, name, webViewLink, webContentLink)").execute(num_retries=3)
     
     movie_data = [{"id": f.get("id"), "name": f.get("name"), "webViewLink": f.get("webViewLink"), "webContentLink": f.get("webContentLink", "#")} for f in results.get('files', [])]
     with open("movies.json", "w", encoding="utf-8") as f:
@@ -163,8 +169,6 @@ async def try_animahd_scrape(query):
         if r.status_code != 200: return None
         soup = BeautifulSoup(r.text, "html.parser")
         
-        # --- THE NAV-BAR BYPASS FIX ---
-        # Ignore site utility links so it doesn't accidentally grab the "Filter" menu
         ignore_links = ["/filter/", "/anime-schedule/", "/dmca/", "/terms/", "/about/", "/contact/"]
         
         anime_page_url = None
@@ -175,7 +179,6 @@ async def try_animahd_scrape(query):
                     anime_page_url = href
                     break
                     
-        # If exact title match fails (due to long names/punctuation), take the first valid result link
         if not anime_page_url:
             for a in soup.find_all("a", href=True):
                 href = a['href']
@@ -365,11 +368,9 @@ async def try_animahd_scrape(query):
 async def try_telegram_bots(query):
     print(f"\n[Source 3] Falling back to Telegram bots for: '{query}'...")
     try:
-        # Note: If your session string was revoked, you must generate a new one!
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
         await client.connect()
         
-        # Check if authorized - if not, the session was banned
         if not await client.is_user_authorized():
             print("[-] Telegram session is invalid or revoked. Please generate a new TG_SESSION string.")
             return None
@@ -421,13 +422,18 @@ def transcode_and_upload(source_file, title_label):
     service = get_drive_service()
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
     metadata = {'name': clean_title + ".mp4", 'parents': [folder_id]}
+    
+    print(f"[*] Uploading '{upload_target}' to Google Drive...")
     media = MediaFileUpload(upload_target, mimetype='video/mp4', resumable=True)
     
-    uploaded_file = service.files().create(body=metadata, media_body=media, fields='id').execute()
+    # --- THIS IS THE FIX ---
+    # Added num_retries=5 to automatically resume the upload if the network drops!
+    uploaded_file = service.files().create(body=metadata, media_body=media, fields='id').execute(num_retries=5)
     file_id = uploaded_file.get('id')
+    print(f"[+] Upload complete! File ID: {file_id}")
     
     try:
-        service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
+        service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute(num_retries=5)
     except Exception:
         pass
     
