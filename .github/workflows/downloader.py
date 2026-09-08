@@ -107,70 +107,37 @@ def decode_base64_string(encoded_str):
     except Exception:
         return None
 
-def resolve_gateway_url(url, session):
-    """Deeply parses JS redirects, base64 p= parameters, and gateway targets"""
+def resolve_gateway_url(url):
+    """Directly unwrap multi-layer base64 wrapper URLs without breaking"""
     current_url = url
-    for _ in range(6):
-        parsed = urlparse(current_url)
-        query_params = parse_qs(parsed.query)
-        
-        # 1. Handle base64 'p=' parameters
-        if "p=" in query_params:
+    print(f"[*] Starting gateway resolution for: {current_url}")
+    for i in range(5):
+        # 1. Check for sec_route wrapper (p= parameter)
+        if "sec_route=1" in current_url and "p=" in current_url:
             try:
-                p_part = query_params["p"][0].split("&")[0]
+                p_part = current_url.split("p=")[1].split("&")[0]
                 decoded = decode_base64_string(p_part)
                 if decoded:
+                    print(f"[+] Layer {i+1} Unwrapped (sec_route): {decoded}")
                     current_url = decoded
                     continue
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[-] sec_route decode error: {e}")
                 
-        # 2. Handle base64 'target=' parameters
+        # 2. Check for gateway target wrapper (target= parameter)
+        parsed = urlparse(current_url)
+        query_params = parse_qs(parsed.query)
         if "target=" in query_params:
             try:
                 target_part = query_params["target"][0].split("&")[0]
                 decoded = decode_base64_string(target_part)
                 if decoded:
+                    print(f"[+] Layer {i+1} Unwrapped (target): {decoded}")
                     current_url = decoded
                     continue
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[-] target decode error: {e}")
                 
-        # 3. Fetch page and extract JS/HTML redirect targets if stuck on a gateway or player page
-        try:
-            r = session.get(current_url, timeout=12, allow_redirects=True)
-            soup = BeautifulSoup(r.text, "html.parser")
-            
-            # Search script tags for window.location or redirection links
-            redirect_found = False
-            for script in soup.find_all("script"):
-                script_text = script.string or ""
-                matches = re.findall(r'https?://[^\s\'"]+', script_text)
-                for candidate in matches:
-                    if "animesuki.online" in candidate or "animahd.online" in candidate or "target=" in candidate or "sec_route=1" in candidate:
-                        current_url = candidate
-                        redirect_found = True
-                        break
-                if redirect_found:
-                    break
-                    
-            if redirect_found:
-                continue
-                
-            # Search anchor links on gateway interstitial pages (like "Continue" or "Go To Destination")
-            for a in soup.find_all("a", href=True):
-                href = a['href']
-                if "animesuki.online" in href or "target=" in href or "sec_route=1" in href or "passed=1" in href:
-                    current_url = urljoin(r.url, href)
-                    redirect_found = True
-                    break
-                    
-            if redirect_found:
-                continue
-                
-        except Exception as e:
-            print(f"[-] Gateway loop error: {e}")
-            
         break
     return current_url
 
@@ -322,14 +289,14 @@ def try_animahd_scrape(query):
             print("[-] Episode link not found.")
             return None
             
-        # Resolve gateway loops using JS parser
-        resolved_page = resolve_gateway_url(target_ep_link, session)
+        # Completely unwrap wrapper links to reach the destination page
+        resolved_page = resolve_gateway_url(target_ep_link)
         if "?" in resolved_page:
             resolved_page += "&passed=1"
         else:
             resolved_page += "?passed=1"
             
-        print(f"[*] Final Target Destination: {resolved_page}")
+        print(f"[*] Final Unwrapped Destination: {resolved_page}")
         
         r3 = session.get(resolved_page, timeout=15, allow_redirects=True)
         soup3 = BeautifulSoup(r3.text, "html.parser")
