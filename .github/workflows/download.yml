@@ -1,27 +1,88 @@
-name: Reset Quota (Clone File)
+name: PocketFlix Engine (Download & Quota Reset)
 
 on:
   workflow_dispatch:
     inputs:
-      movie_title:
-        description: 'Movie or Episode name to reset (e.g., Chainsaw Man or Dhamaal)'
+      movie_name:
+        description: 'Movie / Episode Title'
         required: true
         type: string
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'download'
+        type: choice
+        options:
+          - download
+          - reset_quota
 
 jobs:
-  reset:
+  # ==========================================
+  # JOB 1: DOWNLOAD & TRANSCODE PIPELINE
+  # ==========================================
+  download_pipeline:
+    name: Download & Transcode Movie
+    if: ${{ github.event.inputs.action != 'reset_quota' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v3
 
-      - name: Setup Python
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up Python 3.10
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install Google Client
-        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 telethon google-api-python-client google-auth-httplib2 google-auth-oauthlib playwright
+          playwright install chromium
+
+      - name: Run Downloader
+        id: run_downloader
+        env:
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          GCP_CLIENT_ID: ${{ secrets.GCP_CLIENT_ID }}
+          GCP_CLIENT_SECRET: ${{ secrets.GCP_CLIENT_SECRET }}
+          GCP_REFRESH_TOKEN: ${{ secrets.GCP_REFRESH_TOKEN }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          MOVIE_NAME: ${{ github.event.inputs.movie_name }}
+          RUN_MODE: "all"
+        run: |
+          python downloader.py
+
+      - name: Commit & Push movies.json
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add movies.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Add ${{ github.event.inputs.movie_name }} to movies.json" && git push origin main)
+
+  # ==========================================
+  # JOB 2: INSTANT QUOTA RESET PIPELINE
+  # ==========================================
+  reset_quota_pipeline:
+    name: Reset 24-Hour Drive Quota
+    if: ${{ github.event.inputs.action == 'reset_quota' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Google Drive API Client
+        run: |
+          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
       - name: Clone Locked File & Refresh ID
         env:
@@ -29,7 +90,7 @@ jobs:
           GCP_CLIENT_SECRET: ${{ secrets.GCP_CLIENT_SECRET }}
           GCP_REFRESH_TOKEN: ${{ secrets.GCP_REFRESH_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-          TARGET_NAME: ${{ inputs.movie_title }}
+          TARGET_NAME: ${{ github.event.inputs.movie_name }}
         run: |
           python - << 'EOF'
           import os
@@ -56,31 +117,31 @@ jobs:
               if target in item.get("name", "").lower():
                   old_id = item["id"]
                   file_name = item["name"]
-                  print(f"[*] Found locked file: {file_name} (ID: {old_id})")
+                  print(f"[*] Found target file: '{file_name}' (Current ID: {old_id})")
 
-                  # 1. Clone file server-side (0 MB bandwidth, takes 1 second)
+                  # Server-side clone: creates a fresh File ID with 0 download traffic recorded
                   copy_metadata = {
                       'name': file_name,
                       'parents': [folder_id] if folder_id else []
                   }
                   copied_file = service.files().copy(fileId=old_id, body=copy_metadata).execute()
                   new_id = copied_file.get("id")
-                  print(f"[+] Cloned successfully! New fresh File ID: {new_id}")
+                  print(f"[+] Server-side copy complete! Fresh File ID: {new_id}")
 
-                  # 2. Grant public view permission to the new clone
+                  # Make new clone public
                   service.permissions().create(
                       fileId=new_id,
                       body={"type": "anyone", "role": "reader"}
                   ).execute()
 
-                  # 3. Delete the old rate-limited file
+                  # Remove the quota-exhausted file
                   try:
                       service.files().delete(fileId=old_id).execute()
-                      print(f"[*] Deleted old locked file ({old_id})")
+                      print(f"[*] Deleted rate-limited file ({old_id})")
                   except Exception as e:
                       print(f"[-] Could not delete old file: {e}")
 
-                  # 4. Update the JSON entry
+                  # Update record in movies.json
                   item["id"] = new_id
                   item["webViewLink"] = f"https://drive.google.com/file/d/{new_id}/view"
                   item["webContentLink"] = f"https://drive.google.com/uc?id={new_id}&export=download"
@@ -90,9 +151,9 @@ jobs:
           if updated:
               with open("movies.json", "w", encoding="utf-8") as f:
                   json.dump(movies, f, indent=4)
-              print("[+] movies.json updated with fresh File ID.")
+              print("[+] movies.json updated successfully.")
           else:
-              print("[-] No matching file found in movies.json.")
+              print(f"[-] No file matching '{target}' was found in movies.json.")
               exit(1)
           EOF
 
@@ -101,4 +162,4 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add movies.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Reset quota for ${{ inputs.movie_title }}" && git push origin main)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Reset quota for ${{ github.event.inputs.movie_name }}" && git push origin main)
