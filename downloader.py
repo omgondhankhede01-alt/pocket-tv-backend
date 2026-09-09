@@ -131,39 +131,6 @@ def is_title_match(target_title, candidate_title):
 
     return False, ratio
 
-def classify_media_request(title):
-    has_episode_tag = bool(re.search(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', title, re.IGNORECASE))
-    core_name = re.sub(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', '', title, flags=re.IGNORECASE)
-    core_name = re.sub(r'[:\-–].*$', '', core_name)
-    core_name = re.sub(r'\b(the\s+movie|movie|film)\b', '', core_name, flags=re.IGNORECASE).strip()
-    is_movie_keyword = bool(re.search(r'\b(movie|film|the movie|part \d+)\b', title, re.IGNORECASE))
-    
-    query = """
-    query ($search: String) {
-      Media (search: $search, type: ANIME) {
-        format
-        title { english romaji }
-      }
-    }
-    """
-    try:
-        r = requests.post('https://graphql.anilist.co', json={'query': query, 'variables': {'search': core_name}}, timeout=5)
-        if r.status_code == 200:
-            data = r.json().get('data', {}).get('Media')
-            if data:
-                fmt = data.get('format', '')
-                if (fmt == 'MOVIE' or is_movie_keyword) and not has_episode_tag:
-                    return "ANIME_MOVIE"
-                return "ANIME_SERIES"
-    except Exception:
-        pass
-
-    if has_episode_tag:
-        return "ANIME_SERIES"
-    if is_movie_keyword and any(k in title.lower() for k in ["anime", "demon slayer", "chainsaw", "jujutsu", "hero"]):
-        return "ANIME_MOVIE"
-    return "STANDARD_MOVIE"
-
 def get_drive_service():
     creds = Credentials(
         token=None,
@@ -507,7 +474,6 @@ async def try_telegram_bots(query):
         print("[-] TG_SESSION is not set.")
         return None
 
-    # Sanitize query: strip colons, brackets, and symbols before messaging bots
     clean_bot_query = clean_text(query)
     print(f"\n[Source: Telegram] Engaging bots for: '{clean_bot_query}' (Raw: '{query}')...")
     client = None
@@ -684,20 +650,18 @@ async def main():
     if not MOVIE_NAME:
         sys.exit(1)
 
-    media_type = classify_media_request(MOVIE_NAME)
-    print(f"[*] Classified '{MOVIE_NAME}' as: [{media_type}]")
+    print(f"[*] Starting universal search and scrape for: '{MOVIE_NAME}'")
 
     downloaded = None
 
     if RUN_MODE in ["web", "all"]:
-        if media_type == "STANDARD_MOVIE":
-            downloaded = try_filmyzilla_scrape(MOVIE_NAME)
-        elif media_type == "ANIME_SERIES":
+        # 1. Try Filmyzilla first for any media type
+        downloaded = try_filmyzilla_scrape(MOVIE_NAME)
+        
+        # 2. If Filmyzilla doesn't have it, universally fall back to AnimaHD
+        if not downloaded:
+            print("[*] Filmyzilla returned no result. Trying AnimaHD...")
             downloaded = await try_animahd_scrape(MOVIE_NAME)
-        elif media_type == "ANIME_MOVIE":
-            downloaded = try_filmyzilla_scrape(MOVIE_NAME)
-            if not downloaded:
-                downloaded = await try_animahd_scrape(MOVIE_NAME)
 
     if not downloaded and RUN_MODE in ["telegram", "all"]:
         downloaded = await try_telegram_bots(MOVIE_NAME)
