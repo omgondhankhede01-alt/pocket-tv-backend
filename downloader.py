@@ -34,7 +34,6 @@ ACTIVE_BOTS = [
     "@iPapkornA2bot"
 ]
 
-# Updated Filmyzilla domain
 FILMYZILLA_DOMAIN = "https://www.filmyzilla67.com"
 ANIMAHD_DOMAIN = "https://animahd.com"
 
@@ -89,15 +88,17 @@ def get_quality_score(text):
         return -100
     return 40
 
-# --- SMART MEDIA CLASSIFIER ---
+# --- ROBUST MEDIA CLASSIFIER ---
 def classify_media_request(title):
-    """
-    Returns: 'ANIME_SERIES', 'ANIME_MOVIE', or 'STANDARD_MOVIE'
-    """
     has_episode_tag = bool(re.search(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', title, re.IGNORECASE))
-    base_title = re.sub(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', '', title, flags=re.IGNORECASE).strip()
     
-    # Query AniList GraphQL to determine if it is officially classified as Anime
+    # Extract root franchise name (strip subtitles, "The Movie", etc.)
+    core_name = re.sub(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', '', title, flags=re.IGNORECASE)
+    core_name = re.sub(r'[:\-–].*$', '', core_name)
+    core_name = re.sub(r'\b(the\s+movie|movie|film)\b', '', core_name, flags=re.IGNORECASE).strip()
+    
+    is_movie_keyword = bool(re.search(r'\b(movie|film|the movie|part \d+)\b', title, re.IGNORECASE))
+    
     query = """
     query ($search: String) {
       Media (search: $search, type: ANIME) {
@@ -107,30 +108,21 @@ def classify_media_request(title):
     }
     """
     try:
-        r = requests.post(
-            'https://graphql.anilist.co',
-            json={'query': query, 'variables': {'search': base_title}},
-            timeout=5
-        )
+        r = requests.post('https://graphql.anilist.co', json={'query': query, 'variables': {'search': core_name}}, timeout=5)
         if r.status_code == 200:
             data = r.json().get('data', {}).get('Media')
             if data:
-                ani_eng = clean_text(data.get('title', {}).get('english') or '')
-                ani_rom = clean_text(data.get('title', {}).get('romaji') or '')
-                clean_target = clean_text(base_title)
-                target_words = [w for w in clean_target.split() if w not in STOP_WORDS]
-                
-                # Check for significant title overlap
-                if any(w in ani_eng for w in target_words) or any(w in ani_rom for w in target_words):
-                    fmt = data.get('format', '')
-                    if fmt == 'MOVIE' and not has_episode_tag:
-                        return "ANIME_MOVIE"
-                    return "ANIME_SERIES"
+                fmt = data.get('format', '')
+                if (fmt == 'MOVIE' or is_movie_keyword) and not has_episode_tag:
+                    return "ANIME_MOVIE"
+                return "ANIME_SERIES"
     except Exception:
         pass
 
     if has_episode_tag:
         return "ANIME_SERIES"
+    if is_movie_keyword and any(k in title.lower() for k in ["anime", "demon slayer", "chainsaw", "jujutsu", "hero"]):
+        return "ANIME_MOVIE"
     return "STANDARD_MOVIE"
 
 def get_drive_service():
@@ -171,7 +163,7 @@ def decode_base64_string(encoded_str):
     except Exception:
         return None
 
-# --- SOURCE 1: FILMYZILLA SCRAPER ---
+# --- SOURCE 1: FILMYZILLA SCRAPER (MULTI-TIER QUERY) ---
 def try_filmyzilla_scrape(query):
     if not BeautifulSoup:
         return None
@@ -182,49 +174,68 @@ def try_filmyzilla_scrape(query):
     episode_match = re.search(r'\bE(\d{1,2})\b', query, re.IGNORECASE)
     base_title = re.sub(r'\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
     
-    slug = re.sub(r'[^a-zA-Z0-9]+', '-', base_title).strip('-').lower()
-    search_urls = [
-        f"{FILMYZILLA_DOMAIN}/search/{slug}.html",
-        f"{FILMYZILLA_DOMAIN}/search.php?q={quote_plus(base_title)}"
-    ]
+    # Strip colons and punctuation
+    cleaned_base = re.sub(r'[:\-–]', ' ', base_title)
+    cleaned_base = re.sub(r'\s+', ' ', cleaned_base).strip()
     
+    # Extract core root title for fallback search (e.g. "Chainsaw Man")
+    core_title = re.sub(r'\b(the\s+movie|movie|reze\s+arc|arc)\b.*$', '', cleaned_base, flags=re.IGNORECASE).strip()
+    if not core_title or len(core_title) < 3:
+        core_title = cleaned_base.split()[0]
+
+    search_terms = [cleaned_base, core_title]
     soup = None
-    for s_url in search_urls:
-        try:
-            r = session.get(s_url, timeout=12)
-            if r.status_code == 200 and len(r.text) > 1000:
-                soup = BeautifulSoup(r.text, "html.parser")
-                break
-        except Exception:
-            continue
+
+    for term in search_terms:
+        slug = re.sub(r'[^a-zA-Z0-9]+', '-', term).strip('-').lower()
+        search_urls = [
+            f"{FILMYZILLA_DOMAIN}/search/{slug}.html",
+            f"{FILMYZILLA_DOMAIN}/search.php?q={quote_plus(term)}"
+        ]
+        for s_url in search_urls:
+            try:
+                r = session.get(s_url, timeout=12)
+                if r.status_code == 200 and len(r.text) > 1000:
+                    temp_soup = BeautifulSoup(r.text, "html.parser")
+                    # Check if search returned any movie links
+                    found = [a for a in temp_soup.find_all("a", href=True) if any(k in a['href'] for k in ["/movie/", "/files/"])]
+                    if found:
+                        soup = temp_soup
+                        print(f"[*] Search matched using query: '{term}'")
+                        break
+            except Exception:
+                continue
+        if soup:
+            break
 
     if not soup:
-        print("[-] Filmyzilla returned no search page.")
+        print("[-] Filmyzilla search returned 0 results.")
         return None
 
-    query_words = [w for w in clean_text(base_title).split() if len(w) > 1 and w not in STOP_WORDS]
-    if not query_words:
-        query_words = clean_text(base_title).split()
+    target_words = [w for w in clean_text(cleaned_base).split() if w not in STOP_WORDS]
+    scored_candidates = []
 
-    candidates = []
     for a in soup.find_all("a", href=True):
         href = a['href']
         text = a.get_text(strip=True)
         clean_t = clean_text(text)
         
         if any(seg in href for seg in ["/movie/", "/files/", "/series/"]):
-            if all(qw in clean_t for qw in query_words):
+            # Count keyword matches
+            matched = sum(1 for w in target_words if w in clean_t)
+            if matched >= max(1, len(target_words) // 2):
                 full_href = urljoin(FILMYZILLA_DOMAIN, href)
-                score = get_quality_score(text)
-                candidates.append((score, text, full_href))
+                quality_score = get_quality_score(text)
+                scored_candidates.append((matched, quality_score, text, full_href))
 
-    if not candidates:
+    if not scored_candidates:
         print(f"[-] No matching candidate found on Filmyzilla for '{base_title}'.")
         return None
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    target_page = candidates[0][2]
-    print(f"[+] Found candidate: '{candidates[0][1]}' -> {target_page}")
+    # Sort by highest keyword match first, then quality score
+    scored_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    target_page = scored_candidates[0][3]
+    print(f"[+] Selected title: '{scored_candidates[0][2]}' -> {target_page}")
     
     try:
         r2 = session.get(target_page, timeout=12)
@@ -253,7 +264,7 @@ def try_filmyzilla_scrape(query):
             tier_candidates.sort(key=lambda x: x[0], reverse=True)
             selected_tier = (tier_candidates[0][1], tier_candidates[0][2])
 
-        print(f"[*] Filmyzilla selected tier: '{selected_tier[0]}'")
+        print(f"[*] Selected download tier: '{selected_tier[0]}'")
 
         r3 = session.get(selected_tier[1], timeout=12)
         soup3 = BeautifulSoup(r3.text, "html.parser")
@@ -269,7 +280,7 @@ def try_filmyzilla_scrape(query):
             else:
                 return None
 
-        print(f"[+] Streaming from: {server_links[0]}")
+        print(f"[+] Streaming video from: {server_links[0]}")
         res = session.get(server_links[0], stream=True, allow_redirects=True, timeout=20)
         if res.status_code == 200:
             local_dl = "temp_raw_stream.mkv"
@@ -278,7 +289,7 @@ def try_filmyzilla_scrape(query):
                     if chunk: f.write(chunk)
             return local_dl
     except Exception as e:
-        print(f"[-] Filmyzilla error: {e}")
+        print(f"[-] Filmyzilla stream error: {e}")
     return None
 
 # --- SOURCE 2: ANIMAHd SCRAPER ---
@@ -306,7 +317,6 @@ async def try_animahd_scrape(query):
         ignore_links = ["/filter/", "/anime-schedule/", "/dmca/", "/terms/", "/about/", "/contact/"]
         anime_page_url = None
 
-        # STRICT TITLE VERIFICATION: Prevents grabbing wrong anime
         for a in soup.find_all("a", href=True):
             href = a['href']
             clean_t = clean_text(a.get_text())
@@ -316,7 +326,7 @@ async def try_animahd_scrape(query):
                     break
                     
         if not anime_page_url:
-            print(f"[-] Title not found on AnimaHD. Skipping cleanly.")
+            print(f"[-] Not found on AnimaHD.")
             return None
 
         print(f"[*] Found Series Page: {anime_page_url}")
@@ -347,10 +357,10 @@ async def try_animahd_scrape(query):
             target_ep_link = episode_links[0][2]
             
         if not target_ep_link:
-            print("[-] Episode link not found.")
+            print("[-] No matching episode links on series page.")
             return None
             
-        print(f"[*] Dispatching browser automation...")
+        print(f"[*] Dispatching headless browser...")
         install_browser_engine()
         from playwright.async_api import async_playwright
         
@@ -464,26 +474,26 @@ async def try_animahd_scrape(query):
 # --- SOURCE 3: TELEGRAM BOTS FALLBACK ---
 async def try_telegram_bots(query):
     if not SESSION_STRING:
-        print("[-] TG_SESSION environment variable is empty. Cannot use Telegram.")
+        print("[-] TG_SESSION is not set.")
         return None
 
-    print(f"\n[Source: Telegram] Engaging Telegram bots for: '{query}'...")
+    print(f"\n[Source: Telegram] Engaging bots for: '{query}'...")
     client = None
     try:
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
         await client.connect()
         
         if not await client.is_user_authorized():
-            print("[-] Telegram session is invalid or unauthorized. Regenerate TG_SESSION.")
+            print("[-] Telegram session invalid.")
             return None
 
         for bot in ACTIVE_BOTS:
-            print(f"[*] Sending search query to bot: {bot}...")
+            print(f"[*] Querying bot: {bot}...")
             try:
                 sent_msg = await client.send_message(bot, query)
                 out_id = sent_msg.id
             except Exception as e:
-                print(f"[-] Failed sending message to {bot}: {e}")
+                print(f"[-] Could not send to {bot}: {e}")
                 continue
 
             start_time = time.time()
@@ -491,7 +501,6 @@ async def try_telegram_bots(query):
 
             while time.time() - start_time < 30:
                 async for msg in client.iter_messages(bot, min_id=out_id, limit=20):
-                    # Handle inline keyboard buttons sent by Telegram bots
                     if msg.buttons:
                         for row in msg.buttons:
                             for btn in row:
@@ -503,7 +512,6 @@ async def try_telegram_bots(query):
                                     except Exception:
                                         pass
 
-                    # Collect incoming documents/media
                     if (msg.media or msg.document or msg.video) and msg.id not in [m.id for m in media_messages]:
                         media_messages.append(msg)
                 
@@ -526,7 +534,7 @@ async def try_telegram_bots(query):
 
                 scored_msgs.sort(key=lambda x: x[0], reverse=True)
                 best_score, best_msg, best_fname = scored_msgs[0]
-                print(f"[+] Selected Telegram file: '{best_fname}' (Quality Score: {best_score})")
+                print(f"[+] Selected Telegram file: '{best_fname}' (Quality: {best_score})")
 
                 final_name = best_fname or "video.mp4"
                 dl_path = await best_msg.download_media(file=f"temp_{final_name}")
@@ -537,7 +545,7 @@ async def try_telegram_bots(query):
     finally:
         if client and client.is_connected():
             await client.disconnect()
-            print("[*] Telegram session closed.")
+            print("[*] Telegram disconnected cleanly.")
     return None
 
 def probe_file_streams(filepath):
@@ -577,7 +585,7 @@ def transcode_and_upload(source_file, title_label):
     is_a_safe = a_codec in ["aac", "mp3", "ac3"]
     
     if is_v_safe and is_a_safe:
-        print("[+] Stream is fully TV-compliant. Remuxing instantaneously...")
+        print("[+] Fully TV compliant. Remuxing instantaneously...")
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", source_file,
             "-c", "copy",
@@ -585,7 +593,7 @@ def transcode_and_upload(source_file, title_label):
             final_output
         ]
     elif is_v_safe and not is_a_safe:
-        print("[*] Remuxing video and transcoding audio to AAC...")
+        print("[*] Video is compatible; converting audio to AAC...")
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", source_file,
             "-c:v", "copy",
@@ -594,7 +602,7 @@ def transcode_and_upload(source_file, title_label):
             final_output
         ]
     else:
-        print("[!] Re-encoding to universal 8-bit H.264 profile for legacy TV support...")
+        print("[!] Re-encoding to universal 8-bit H.264 profile...")
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", source_file,
             "-vf", "scale='min(1920,iw)':-2",
@@ -637,21 +645,16 @@ async def main():
 
     downloaded = None
 
-    # Routing based on media classification
     if RUN_MODE in ["web", "all"]:
         if media_type == "STANDARD_MOVIE":
-            # Live-action movies: Check Filmyzilla only (skip AnimaHD)
             downloaded = try_filmyzilla_scrape(MOVIE_NAME)
         elif media_type == "ANIME_SERIES":
-            # Episodic anime: Check AnimaHD only (skip Filmyzilla)
             downloaded = await try_animahd_scrape(MOVIE_NAME)
         elif media_type == "ANIME_MOVIE":
-            # Anime movie: Search all web sources
             downloaded = try_filmyzilla_scrape(MOVIE_NAME)
             if not downloaded:
                 downloaded = await try_animahd_scrape(MOVIE_NAME)
 
-    # Telegram fallback for all media types
     if not downloaded and RUN_MODE in ["telegram", "all"]:
         downloaded = await try_telegram_bots(MOVIE_NAME)
 
