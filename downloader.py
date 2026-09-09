@@ -42,7 +42,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-STOP_WORDS = {"the", "a", "an", "of", "in", "on", "and", "or", "to", "for", "with", "at", "by", "hindi", "dubbed"}
+STOP_WORDS = {"the", "a", "an", "of", "in", "on", "and", "or", "to", "for", "with", "at", "by", "hindi", "dubbed", "english", "movie", "series"}
 
 def set_github_output(name, value):
     output_file = os.environ.get("GITHUB_OUTPUT")
@@ -53,8 +53,19 @@ def set_github_output(name, value):
         except Exception:
             pass
 
+# Replaces all punctuation with spaces so "Spider-Man:" becomes "spider man"
 def clean_text(text):
-    return re.sub(r'[^a-zA-Z0-9\s]', '', text).lower().strip()
+    if not text:
+        return ""
+    normalized = unicodedata.normalize('NFKD', str(text)).encode('ascii', 'ignore').decode('utf-8')
+    return re.sub(r'[^a-zA-Z0-9]+', ' ', normalized).lower().strip()
+
+# Strips all whitespace and punctuation for exact substring validation
+def compact_text(text):
+    if not text:
+        return ""
+    normalized = unicodedata.normalize('NFKD', str(text)).encode('ascii', 'ignore').decode('utf-8')
+    return re.sub(r'[^a-zA-Z0-9]', '', normalized).lower().strip()
 
 def sanitize_title(title):
     clean = unicodedata.normalize('NFKD', title).encode('ascii', 'ignore').decode('utf-8')
@@ -84,9 +95,41 @@ def get_quality_score(text):
         return 80
     if re.search(r'\b(2160p|4k|uhd)\b', t):
         return -50
-    if re.search(r'\b(480p|360p|240p|sd|dvdrip|camrip|cam|ts)\b', t):
-        return -100
+    if re.search(r'\b(480p|360p|240p|sd|dvdrip)\b', t):
+        return 30
+    if re.search(r'\b(camrip|cam|ts)\b', t):
+        return 20
     return 40
+
+def is_title_match(target_title, candidate_title):
+    t_clean = clean_text(target_title)
+    c_clean = clean_text(candidate_title)
+    
+    t_compact = compact_text(target_title)
+    c_compact = compact_text(candidate_title)
+    
+    # 1. Compact check: "spidermanbrandnewday" inside "spidermanbrandnewday2026englishmovie"
+    if t_compact and c_compact:
+        if t_compact in c_compact or c_compact in t_compact:
+            return True, 1.0
+
+    # 2. Tokenized check
+    t_words = [w for w in t_clean.split() if w not in STOP_WORDS]
+    if not t_words:
+        t_words = t_clean.split()
+        
+    c_words = set(c_clean.split())
+    if not t_words or not c_words:
+        return False, 0.0
+
+    matched = [w for w in t_words if w in c_words]
+    ratio = len(matched) / len(t_words)
+
+    # Allow matches if 50% or more key words match
+    if ratio >= 0.50:
+        return True, ratio
+
+    return False, ratio
 
 def classify_media_request(title):
     has_episode_tag = bool(re.search(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', title, re.IGNORECASE))
@@ -169,17 +212,18 @@ def try_filmyzilla_scrape(query):
     episode_match = re.search(r'\bE(\d{1,2})\b', query, re.IGNORECASE)
     base_title = re.sub(r'\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
     
-    cleaned_base = re.sub(r'[:\-–]', ' ', base_title)
-    cleaned_base = re.sub(r'\s+', ' ', cleaned_base).strip()
-    
+    # Strip punctuation to create clean search phrases
+    cleaned_base = clean_text(base_title)
     core_title = re.sub(r'\b(the\s+movie|movie|reze\s+arc|arc)\b.*$', '', cleaned_base, flags=re.IGNORECASE).strip()
     if not core_title or len(core_title) < 3:
-        core_title = cleaned_base.split()[0]
+        core_title = cleaned_base.split()[0] if cleaned_base.split() else cleaned_base
 
     search_terms = [cleaned_base, core_title]
     soup = None
 
     for term in search_terms:
+        if not term:
+            continue
         slug = re.sub(r'[^a-zA-Z0-9]+', '-', term).strip('-').lower()
         search_urls = [
             f"{FILMYZILLA_DOMAIN}/search/{slug}.html",
@@ -188,9 +232,9 @@ def try_filmyzilla_scrape(query):
         for s_url in search_urls:
             try:
                 r = session.get(s_url, timeout=12)
-                if r.status_code == 200 and len(r.text) > 1000:
+                if r.status_code == 200 and len(r.text) > 800:
                     temp_soup = BeautifulSoup(r.text, "html.parser")
-                    found = [a for a in temp_soup.find_all("a", href=True) if any(k in a['href'] for k in ["/movie/", "/files/"])]
+                    found = [a for a in temp_soup.find_all("a", href=True) if any(k in a['href'] for k in ["/movie/", "/files/", "/file/"])]
                     if found:
                         soup = temp_soup
                         print(f"[*] Search matched using query: '{term}'")
@@ -204,29 +248,17 @@ def try_filmyzilla_scrape(query):
         print("[-] Filmyzilla search returned 0 results.")
         return None
 
-    target_words = set(w for w in clean_text(cleaned_base).split() if w not in STOP_WORDS)
-    if not target_words:
-        target_words = set(clean_text(cleaned_base).split())
-
     scored_candidates = []
 
-    # Strict token-based whole word matching
     for a in soup.find_all("a", href=True):
         href = a['href']
         text = a.get_text(strip=True)
-        clean_t = clean_text(text)
-        
-        if any(seg in href for seg in ["/movie/", "/files/", "/series/"]):
-            candidate_words = set(clean_t.split())
-            matched_words = target_words.intersection(candidate_words)
-            matched_count = len(matched_words)
-            match_ratio = matched_count / len(target_words) if target_words else 0
-            
-            # Require at least 75% standalone word correspondence
-            if match_ratio >= 0.75:
+        if any(seg in href for seg in ["/movie/", "/files/", "/series/", "/file/"]):
+            matched, ratio = is_title_match(base_title, text)
+            if matched:
                 full_href = urljoin(FILMYZILLA_DOMAIN, href)
                 quality_score = get_quality_score(text)
-                scored_candidates.append((match_ratio, quality_score, text, full_href))
+                scored_candidates.append((ratio, quality_score, text, full_href))
 
     if not scored_candidates:
         print(f"[-] No valid candidates matched '{base_title}' on Filmyzilla.")
@@ -305,10 +337,9 @@ async def try_animahd_scrape(query):
     
     base_title = re.sub(r'\b(?:s|season)\s*\d{1,2}\s*(?:e|ep|episode)\s*\d{1,2}\b|\b(?:e|ep|episode)\s*\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
     clean_target = clean_text(base_title)
-    target_words = [w for w in clean_target.split() if w not in STOP_WORDS]
 
     try:
-        r = session.get(f"{ANIMAHD_DOMAIN}/?s={quote(base_title)}", timeout=12)
+        r = session.get(f"{ANIMAHD_DOMAIN}/?s={quote(clean_target)}", timeout=12)
         if r.status_code != 200: 
             return None
         soup = BeautifulSoup(r.text, "html.parser")
@@ -318,9 +349,10 @@ async def try_animahd_scrape(query):
 
         for a in soup.find_all("a", href=True):
             href = a['href']
-            clean_t = clean_text(a.get_text())
+            text = a.get_text()
             if ANIMAHD_DOMAIN in href and not any(ig in href.lower() for ig in ignore_links) and href.strip('/') != ANIMAHD_DOMAIN.strip('/'):
-                if all(w in clean_t for w in target_words):
+                matched, _ = is_title_match(base_title, text)
+                if matched:
                     anime_page_url = href
                     break
                     
@@ -475,7 +507,9 @@ async def try_telegram_bots(query):
         print("[-] TG_SESSION is not set.")
         return None
 
-    print(f"\n[Source: Telegram] Engaging bots for: '{query}'...")
+    # Sanitize query: strip colons, brackets, and symbols before messaging bots
+    clean_bot_query = clean_text(query)
+    print(f"\n[Source: Telegram] Engaging bots for: '{clean_bot_query}' (Raw: '{query}')...")
     client = None
     try:
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -488,7 +522,7 @@ async def try_telegram_bots(query):
         for bot in ACTIVE_BOTS:
             print(f"[*] Querying bot: {bot}...")
             try:
-                sent_msg = await client.send_message(bot, query)
+                sent_msg = await client.send_message(bot, clean_bot_query)
                 out_id = sent_msg.id
             except Exception as e:
                 print(f"[-] Could not send to {bot}: {e}")
@@ -497,13 +531,14 @@ async def try_telegram_bots(query):
             start_time = time.time()
             media_messages = []
 
-            while time.time() - start_time < 30:
-                async for msg in client.iter_messages(bot, min_id=out_id, limit=20):
+            while time.time() - start_time < 35:
+                async for msg in client.iter_messages(bot, min_id=out_id, limit=25):
                     if msg.buttons:
                         for row in msg.buttons:
                             for btn in row:
+                                matched, _ = is_title_match(query, btn.text)
                                 score = get_quality_score(btn.text)
-                                if score >= 80 or any(w in btn.text.lower() for w in clean_text(query).split()):
+                                if matched or score >= 80:
                                     try:
                                         await btn.click()
                                         await asyncio.sleep(2)
@@ -515,10 +550,10 @@ async def try_telegram_bots(query):
                 
                 if media_messages:
                     best_current_score = max([get_quality_score(f"{getattr(m.file, 'name', '')} {m.text or ''}") for m in media_messages])
-                    if best_current_score >= 90:
+                    if best_current_score >= 80:
                         break
                         
-                if len(media_messages) >= 2 and (time.time() - start_time > 10):
+                if len(media_messages) >= 2 and (time.time() - start_time > 12):
                     break
                 await asyncio.sleep(2)
 
@@ -527,16 +562,20 @@ async def try_telegram_bots(query):
                 for m in media_messages:
                     f_name = getattr(m.file, 'name', '') or ''
                     caption = m.text or ''
-                    score = get_quality_score(f"{f_name} {caption}")
-                    scored_msgs.append((score, m, f_name))
+                    full_desc = f"{f_name} {caption}"
+                    matched, ratio = is_title_match(query, full_desc)
+                    score = get_quality_score(full_desc)
+                    if matched or ratio >= 0.4:
+                        scored_msgs.append((score, m, f_name))
 
-                scored_msgs.sort(key=lambda x: x[0], reverse=True)
-                best_score, best_msg, best_fname = scored_msgs[0]
-                print(f"[+] Selected Telegram file: '{best_fname}' (Quality: {best_score})")
+                if scored_msgs:
+                    scored_msgs.sort(key=lambda x: x[0], reverse=True)
+                    best_score, best_msg, best_fname = scored_msgs[0]
+                    print(f"[+] Selected Telegram file: '{best_fname}' (Quality: {best_score})")
 
-                final_name = best_fname or "video.mp4"
-                dl_path = await best_msg.download_media(file=f"temp_{final_name}")
-                return dl_path
+                    final_name = best_fname or "video.mp4"
+                    dl_path = await best_msg.download_media(file=f"temp_{final_name}")
+                    return dl_path
 
     except Exception as e:
         print(f"[-] Telegram error: {e}")
@@ -625,7 +664,6 @@ def transcode_and_upload(source_file, title_label):
     file_id = uploaded_file.get('id')
     print(f"[+] Upload complete! File ID: {file_id}")
     
-    # Set public viewer permission so TV streams without Google authentication
     try:
         service.permissions().create(
             fileId=file_id, 
