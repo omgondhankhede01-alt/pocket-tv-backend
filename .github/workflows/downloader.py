@@ -90,11 +90,9 @@ def get_quality_score(text):
 
 def classify_media_request(title):
     has_episode_tag = bool(re.search(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', title, re.IGNORECASE))
-    
     core_name = re.sub(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', '', title, flags=re.IGNORECASE)
     core_name = re.sub(r'[:\-–].*$', '', core_name)
     core_name = re.sub(r'\b(the\s+movie|movie|film)\b', '', core_name, flags=re.IGNORECASE).strip()
-    
     is_movie_keyword = bool(re.search(r'\b(movie|film|the movie|part \d+)\b', title, re.IGNORECASE))
     
     query = """
@@ -212,6 +210,7 @@ def try_filmyzilla_scrape(query):
 
     scored_candidates = []
 
+    # Strict token-based whole word matching
     for a in soup.find_all("a", href=True):
         href = a['href']
         text = a.get_text(strip=True)
@@ -223,13 +222,14 @@ def try_filmyzilla_scrape(query):
             matched_count = len(matched_words)
             match_ratio = matched_count / len(target_words) if target_words else 0
             
+            # Require at least 75% standalone word correspondence
             if match_ratio >= 0.75:
                 full_href = urljoin(FILMYZILLA_DOMAIN, href)
                 quality_score = get_quality_score(text)
                 scored_candidates.append((match_ratio, quality_score, text, full_href))
 
     if not scored_candidates:
-        print(f"[-] No matching candidate found on Filmyzilla for '{base_title}'.")
+        print(f"[-] No valid candidates matched '{base_title}' on Filmyzilla.")
         return None
 
     scored_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -285,7 +285,8 @@ def try_filmyzilla_scrape(query):
             local_dl = "temp_raw_stream.mkv"
             with open(local_dl, "wb") as f:
                 for chunk in res.iter_content(chunk_size=2*1024*1024):
-                    if chunk: f.write(chunk)
+                    if chunk: 
+                        f.write(chunk)
             return local_dl
     except Exception as e:
         print(f"[-] Filmyzilla stream error: {e}")
@@ -579,10 +580,10 @@ def transcode_and_upload(source_file, title_label):
     print(f"[*] Detected streams: Video={v_codec} ({pix_fmt}), Audio={a_codec}")
     
     is_v_safe = (v_codec == "h264") and (pix_fmt == "yuv420p")
-    is_a_safe = a_codec in ["aac", "mp3", "ac3"]
+    is_a_safe = a_codec in ["aac", "mp3"]
     
     if is_v_safe and is_a_safe:
-        print("[+] Fully TV compliant. Remuxing instantaneously...")
+        print("[+] TV compliant streams detected. Remuxing with +faststart header...")
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", source_file,
             "-c", "copy",
@@ -590,22 +591,22 @@ def transcode_and_upload(source_file, title_label):
             final_output
         ]
     elif is_v_safe and not is_a_safe:
-        print("[*] Video is compatible; converting audio to AAC...")
+        print("[*] Video is compatible; converting audio to stereo AAC with +faststart...")
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", source_file,
             "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "128k",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
             "-movflags", "+faststart",
             final_output
         ]
     else:
-        print("[!] Re-encoding to universal 8-bit H.264 profile...")
+        print("[!] Re-encoding to universal Sony TV H.264 profile...")
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", source_file,
             "-vf", "scale='min(1920,iw)':-2",
             "-c:v", "libx264", "-profile:v", "high", "-level", "4.1",
             "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
             "-movflags", "+faststart",
             final_output
         ]
@@ -624,14 +625,22 @@ def transcode_and_upload(source_file, title_label):
     file_id = uploaded_file.get('id')
     print(f"[+] Upload complete! File ID: {file_id}")
     
+    # Set public viewer permission so TV streams without Google authentication
     try:
-        service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute(num_retries=5)
-    except Exception:
-        pass
+        service.permissions().create(
+            fileId=file_id, 
+            body={"type": "anyone", "role": "reader"}
+        ).execute(num_retries=5)
+        print("[+] Public view permission enabled.")
+    except Exception as e:
+        print(f"[-] Permission warning: {e}")
     
     for f in [source_file, final_output]:
         if os.path.exists(f):
-            os.remove(f)
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
 async def main():
     if not MOVIE_NAME:
