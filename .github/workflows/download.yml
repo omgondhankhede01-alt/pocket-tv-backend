@@ -4,18 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       movie_name:
-        description: 'Movie or Series Name (e.g., Smoking Behind the Supermarket with You S01E02)'
+        description: 'Movie or Series Name (e.g., The Dark Knight or Konosuba S01E02)'
         required: true
         type: string
 
-# Cancels duplicate triggers for the EXACT SAME movie, but allows different movies to run in parallel
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.movie_name }}
   cancel-in-progress: true
 
 jobs:
   # ==========================================
-  # STAGE 1: WEB SCRAPERS (PARALLEL EXECUTION)
+  # STAGE 1: WEB SCRAPERS (PARALLEL)
   # ==========================================
   web_scrape:
     runs-on: ubuntu-latest
@@ -45,7 +44,7 @@ jobs:
           playwright install chromium
           playwright install-deps
 
-      - name: Run Web Scrapers (Filmyzilla & AnimaHD)
+      - name: Run Web Scrapers
         id: run_web
         env:
           MOVIE_NAME: ${{ inputs.movie_name }}
@@ -68,7 +67,7 @@ jobs:
           done
 
   # =======================================================
-  # STAGE 2: TELEGRAM FALLBACK (STRICT SEQUENTIAL QUEUE)
+  # STAGE 2: TELEGRAM FALLBACK (SEQUENTIAL LOCK)
   # =======================================================
   telegram_fallback:
     needs: web_scrape
@@ -77,7 +76,6 @@ jobs:
     permissions:
       contents: write
     
-    # THIS ENSURES ONLY ONE TELEGRAM INSTANCE RUNS AT A TIME GLOBALLY
     concurrency:
       group: telegram-session-lock
       cancel-in-progress: false
@@ -96,10 +94,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Install Dependencies (Lightweight - No Playwright Needed)
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests telethon google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          pip install requests beautifulsoup4 telethon google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
       - name: Run Telegram Downloader
         id: run_tg
