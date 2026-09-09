@@ -88,11 +88,9 @@ def get_quality_score(text):
         return -100
     return 40
 
-# --- ROBUST MEDIA CLASSIFIER ---
 def classify_media_request(title):
     has_episode_tag = bool(re.search(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', title, re.IGNORECASE))
     
-    # Extract root franchise name (strip subtitles, "The Movie", etc.)
     core_name = re.sub(r'\b(?:s\d{1,2}e\d{1,2}|e\d{1,2}|ep\s*\d{1,2}|season\s*\d{1,2})\b', '', title, flags=re.IGNORECASE)
     core_name = re.sub(r'[:\-–].*$', '', core_name)
     core_name = re.sub(r'\b(the\s+movie|movie|film)\b', '', core_name, flags=re.IGNORECASE).strip()
@@ -163,7 +161,6 @@ def decode_base64_string(encoded_str):
     except Exception:
         return None
 
-# --- SOURCE 1: FILMYZILLA SCRAPER (MULTI-TIER QUERY) ---
 def try_filmyzilla_scrape(query):
     if not BeautifulSoup:
         return None
@@ -174,11 +171,9 @@ def try_filmyzilla_scrape(query):
     episode_match = re.search(r'\bE(\d{1,2})\b', query, re.IGNORECASE)
     base_title = re.sub(r'\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
     
-    # Strip colons and punctuation
     cleaned_base = re.sub(r'[:\-–]', ' ', base_title)
     cleaned_base = re.sub(r'\s+', ' ', cleaned_base).strip()
     
-    # Extract core root title for fallback search (e.g. "Chainsaw Man")
     core_title = re.sub(r'\b(the\s+movie|movie|reze\s+arc|arc)\b.*$', '', cleaned_base, flags=re.IGNORECASE).strip()
     if not core_title or len(core_title) < 3:
         core_title = cleaned_base.split()[0]
@@ -197,7 +192,6 @@ def try_filmyzilla_scrape(query):
                 r = session.get(s_url, timeout=12)
                 if r.status_code == 200 and len(r.text) > 1000:
                     temp_soup = BeautifulSoup(r.text, "html.parser")
-                    # Check if search returned any movie links
                     found = [a for a in temp_soup.find_all("a", href=True) if any(k in a['href'] for k in ["/movie/", "/files/"])]
                     if found:
                         soup = temp_soup
@@ -212,7 +206,10 @@ def try_filmyzilla_scrape(query):
         print("[-] Filmyzilla search returned 0 results.")
         return None
 
-    target_words = [w for w in clean_text(cleaned_base).split() if w not in STOP_WORDS]
+    target_words = set(w for w in clean_text(cleaned_base).split() if w not in STOP_WORDS)
+    if not target_words:
+        target_words = set(clean_text(cleaned_base).split())
+
     scored_candidates = []
 
     for a in soup.find_all("a", href=True):
@@ -221,18 +218,20 @@ def try_filmyzilla_scrape(query):
         clean_t = clean_text(text)
         
         if any(seg in href for seg in ["/movie/", "/files/", "/series/"]):
-            # Count keyword matches
-            matched = sum(1 for w in target_words if w in clean_t)
-            if matched >= max(1, len(target_words) // 2):
+            candidate_words = set(clean_t.split())
+            matched_words = target_words.intersection(candidate_words)
+            matched_count = len(matched_words)
+            match_ratio = matched_count / len(target_words) if target_words else 0
+            
+            if match_ratio >= 0.75:
                 full_href = urljoin(FILMYZILLA_DOMAIN, href)
                 quality_score = get_quality_score(text)
-                scored_candidates.append((matched, quality_score, text, full_href))
+                scored_candidates.append((match_ratio, quality_score, text, full_href))
 
     if not scored_candidates:
         print(f"[-] No matching candidate found on Filmyzilla for '{base_title}'.")
         return None
 
-    # Sort by highest keyword match first, then quality score
     scored_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
     target_page = scored_candidates[0][3]
     print(f"[+] Selected title: '{scored_candidates[0][2]}' -> {target_page}")
@@ -292,7 +291,6 @@ def try_filmyzilla_scrape(query):
         print(f"[-] Filmyzilla stream error: {e}")
     return None
 
-# --- SOURCE 2: ANIMAHd SCRAPER ---
 async def try_animahd_scrape(query):
     if not BeautifulSoup:
         return None
@@ -471,7 +469,6 @@ async def try_animahd_scrape(query):
         print(f"[-] AnimaHD error: {e}")
         return None
 
-# --- SOURCE 3: TELEGRAM BOTS FALLBACK ---
 async def try_telegram_bots(query):
     if not SESSION_STRING:
         print("[-] TG_SESSION is not set.")
