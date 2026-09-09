@@ -1,123 +1,104 @@
-name: Cloud Movie Downloader
+name: Reset Quota (Clone File)
 
 on:
   workflow_dispatch:
     inputs:
-      movie_name:
-        description: 'Movie or Series Name'
+      movie_title:
+        description: 'Movie or Episode name to reset (e.g., Chainsaw Man or Dhamaal)'
         required: true
         type: string
 
-concurrency:
-  group: ${{ github.workflow }}-${{ inputs.movie_name }}
-  cancel-in-progress: true
-
 jobs:
-  # ==========================================
-  # STAGE 1: WEB SCRAPERS (PARALLEL)
-  # ==========================================
-  web_scrape:
+  reset:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      downloaded: ${{ steps.run_web.outputs.downloaded }}
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install Ffmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+      - name: Install Google Client
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 telethon google-api-python-client google-auth-httplib2 google-auth-oauthlib playwright
-          playwright install chromium
-          playwright install-deps
-
-      - name: Run Web Scrapers
-        id: run_web
+      - name: Clone Locked File & Refresh ID
         env:
-          MOVIE_NAME: ${{ inputs.movie_name }}
-          RUN_MODE: "web"
           GCP_CLIENT_ID: ${{ secrets.GCP_CLIENT_ID }}
           GCP_CLIENT_SECRET: ${{ secrets.GCP_CLIENT_SECRET }}
           GCP_REFRESH_TOKEN: ${{ secrets.GCP_REFRESH_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-        run: python downloader.py
+          TARGET_NAME: ${{ inputs.movie_title }}
+        run: |
+          python - << 'EOF'
+          import os
+          import json
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
 
-      - name: Commit Updated movies.json
-        if: steps.run_web.outputs.downloaded == 'true'
+          creds = Credentials(
+              token=None,
+              refresh_token=os.environ.get("GCP_REFRESH_TOKEN"),
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ.get("GCP_CLIENT_ID"),
+              client_secret=os.environ.get("GCP_CLIENT_SECRET")
+          )
+          service = build('drive', 'v3', credentials=creds)
+          folder_id = os.environ.get("DRIVE_FOLDER_ID")
+          target = os.environ.get("TARGET_NAME", "").strip().lower()
+
+          with open("movies.json", "r", encoding="utf-8") as f:
+              movies = json.load(f)
+
+          updated = False
+          for item in movies:
+              if target in item.get("name", "").lower():
+                  old_id = item["id"]
+                  file_name = item["name"]
+                  print(f"[*] Found locked file: {file_name} (ID: {old_id})")
+
+                  # 1. Clone file server-side (0 MB bandwidth, takes 1 second)
+                  copy_metadata = {
+                      'name': file_name,
+                      'parents': [folder_id] if folder_id else []
+                  }
+                  copied_file = service.files().copy(fileId=old_id, body=copy_metadata).execute()
+                  new_id = copied_file.get("id")
+                  print(f"[+] Cloned successfully! New fresh File ID: {new_id}")
+
+                  # 2. Grant public view permission to the new clone
+                  service.permissions().create(
+                      fileId=new_id,
+                      body={"type": "anyone", "role": "reader"}
+                  ).execute()
+
+                  # 3. Delete the old rate-limited file
+                  try:
+                      service.files().delete(fileId=old_id).execute()
+                      print(f"[*] Deleted old locked file ({old_id})")
+                  except Exception as e:
+                      print(f"[-] Could not delete old file: {e}")
+
+                  # 4. Update the JSON entry
+                  item["id"] = new_id
+                  item["webViewLink"] = f"https://drive.google.com/file/d/{new_id}/view"
+                  item["webContentLink"] = f"https://drive.google.com/uc?id={new_id}&export=download"
+                  updated = True
+                  break
+
+          if updated:
+              with open("movies.json", "w", encoding="utf-8") as f:
+                  json.dump(movies, f, indent=4)
+              print("[+] movies.json updated with fresh File ID.")
+          else:
+              print("[-] No matching file found in movies.json.")
+              exit(1)
+          EOF
+
+      - name: Commit & Push Updated movies.json
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add movies.json
-          git diff-index --quiet HEAD || git commit -m "Update movies.json for ${{ inputs.movie_name }}"
-          for i in {1..5}; do
-            git pull --rebase origin main && git push && break || sleep 3
-          done
-
-  # =======================================================
-  # STAGE 2: TELEGRAM FALLBACK (SEQUENTIAL QUEUE)
-  # =======================================================
-  telegram_fallback:
-    needs: web_scrape
-    if: needs.web_scrape.outputs.downloaded != 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
-    concurrency:
-      group: telegram-session-lock
-      cancel-in-progress: false
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install Ffmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 telethon google-api-python-client google-auth-httplib2 google-auth-oauthlib
-
-      - name: Run Telegram Downloader
-        id: run_tg
-        env:
-          MOVIE_NAME: ${{ inputs.movie_name }}
-          RUN_MODE: "telegram"
-          TG_SESSION: ${{ secrets.TG_SESSION }}
-          GCP_CLIENT_ID: ${{ secrets.GCP_CLIENT_ID }}
-          GCP_CLIENT_SECRET: ${{ secrets.GCP_CLIENT_SECRET }}
-          GCP_REFRESH_TOKEN: ${{ secrets.GCP_REFRESH_TOKEN }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-        run: python downloader.py
-
-      - name: Commit Updated movies.json
-        if: steps.run_tg.outputs.downloaded == 'true'
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add movies.json
-          git diff-index --quiet HEAD || git commit -m "Update movies.json for ${{ inputs.movie_name }}"
-          for i in {1..5}; do
-            git pull --rebase origin main && git push && break || sleep 3
-          done
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Reset quota for ${{ inputs.movie_title }}" && git push origin main)
