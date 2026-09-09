@@ -1,0 +1,62 @@
+name: Force Sync Drive Library
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync_library:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Google API Client
+        run: |
+          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
+      - name: Scan Drive & Rebuild movies.json
+        env:
+          GCP_CLIENT_ID: ${{ secrets.GCP_CLIENT_ID }}
+          GCP_CLIENT_SECRET: ${{ secrets.GCP_CLIENT_SECRET }}
+          GCP_REFRESH_TOKEN: ${{ secrets.GCP_REFRESH_TOKEN }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        run: |
+          python - << 'EOF'
+          import os, json
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+
+          creds = Credentials(
+              token=None,
+              refresh_token=os.environ.get("GCP_REFRESH_TOKEN"),
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ.get("GCP_CLIENT_ID"),
+              client_secret=os.environ.get("GCP_CLIENT_SECRET")
+          )
+          service = build('drive', 'v3', credentials=creds)
+          folder_id = os.environ.get("DRIVE_FOLDER_ID")
+          
+          print("[*] Scanning Google Drive for active files...")
+          query = f"'{folder_id}' in parents and trashed = false"
+          results = service.files().list(q=query, pageSize=200, fields="files(id, name, webViewLink, webContentLink)").execute()
+          
+          files = results.get('files', [])
+          movies = [{"id": f.get("id"), "name": f.get("name"), "webViewLink": f.get("webViewLink"), "webContentLink": f.get("webContentLink", "#")} for f in files]
+          
+          with open("movies.json", "w", encoding="utf-8") as f:
+              json.dump(movies, f, indent=4)
+          
+          print(f"[+] Successfully rebuilt movies.json with {len(movies)} files.")
+          EOF
+
+      - name: Commit & Push Fix
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add movies.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Force resync movies.json with Google Drive" && git push origin main)
