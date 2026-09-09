@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       movie_name:
-        description: 'Movie or Series Name (e.g., The Dark Knight or Konosuba S01E02)'
+        description: 'Movie or Series Name'
         required: true
         type: string
 
@@ -67,7 +67,7 @@ jobs:
           done
 
   # =======================================================
-  # STAGE 2: TELEGRAM FALLBACK (SEQUENTIAL LOCK)
+  # STAGE 2: TELEGRAM FALLBACK (SEQUENTIAL QUEUE)
   # =======================================================
   telegram_fallback:
     needs: web_scrape
