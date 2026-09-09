@@ -10,14 +10,13 @@ import base64
 import unicodedata
 import socket
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote, urlparse, parse_qs
+from urllib.parse import urljoin, quote, quote_plus, urlparse, parse_qs
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# Increase global timeout for massive file uploads to prevent TimeoutError
 socket.setdefaulttimeout(300)
 
 API_ID = 32183183
@@ -108,10 +107,10 @@ def install_browser_engine():
     try:
         import playwright
     except ImportError:
-        print("[*] Human-simulation engine not found. Installing headless browser...")
+        print("[*] Installing headless browser engine...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
         subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-        print("[+] Headless browser installed successfully!")
+        print("[+] Headless browser ready.")
 
 def decode_base64_string(encoded_str):
     try:
@@ -130,37 +129,66 @@ def try_filmyzilla_scrape(query):
     episode_match = re.search(r'\bE(\d{1,2})\b', query, re.IGNORECASE)
     base_title = re.sub(r'\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
     
-    try:
-        r = session.get(f"{FILMYZILLA_DOMAIN}/search/{quote(base_title)}.html", timeout=12)
-        if r.status_code != 200: return None
-    except Exception:
+    # Fix: Generate hyphenated slug to prevent Apache rewrite 404 errors
+    slug = re.sub(r'[^a-zA-Z0-9]+', '-', base_title).strip('-').lower()
+    search_urls = [
+        f"{FILMYZILLA_DOMAIN}/search/{slug}.html",
+        f"{FILMYZILLA_DOMAIN}/search.php?q={quote_plus(base_title)}"
+    ]
+    
+    soup = None
+    for s_url in search_urls:
+        try:
+            r = session.get(s_url, timeout=12)
+            if r.status_code == 200 and len(r.text) > 1000:
+                soup = BeautifulSoup(r.text, "html.parser")
+                break
+        except Exception as e:
+            print(f"[-] Failed reaching {s_url}: {e}")
+            continue
+
+    if not soup:
+        print("[-] Filmyzilla search endpoints returned no valid response.")
         return None
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    query_words = [w for w in clean_text(base_title).split() if len(w) > 2]
     candidates = []
-    for a in soup.find_all("a", href=True):
-        if any(seg in a['href'] for seg in ["/movie/", "/series/"]) and clean_text(base_title) in clean_text(a.get_text()):
-            href = urljoin(FILMYZILLA_DOMAIN, a['href'])
-            txt = a.get_text(strip=True)
-            score = get_quality_score(txt)
-            candidates.append((score, txt, href))
 
-    if not candidates: return None
+    for a in soup.find_all("a", href=True):
+        href = a['href']
+        text = a.get_text(strip=True)
+        clean_t = clean_text(text)
+        
+        if any(seg in href for seg in ["/movie/", "/files/", "/series/"]):
+            # Keyword overlap matching ensures variations like 'The Dark Knight (2008)' match properly
+            if all(qw in clean_t for qw in query_words):
+                full_href = urljoin(FILMYZILLA_DOMAIN, href)
+                score = get_quality_score(text)
+                candidates.append((score, text, full_href))
+
+    if not candidates:
+        print(f"[-] No matching title candidates found on Filmyzilla for '{base_title}'.")
+        return None
+
     candidates.sort(key=lambda x: x[0], reverse=True)
     target_page = candidates[0][2]
+    print(f"[+] Found candidate: '{candidates[0][1]}' -> {target_page}")
     
     try:
         r2 = session.get(target_page, timeout=12)
         soup2 = BeautifulSoup(r2.text, "html.parser")
         tier_candidates = []
+
         for a in soup2.find_all("a", href=True):
-            if "/server/" in a['href']:
+            if any(k in a['href'] for k in ["/server/", "/file/", "/download/"]):
                 href = urljoin(FILMYZILLA_DOMAIN, a['href'])
                 txt = a.get_text(strip=True)
                 score = get_quality_score(txt)
                 tier_candidates.append((score, txt, href))
 
-        if not tier_candidates: return None
+        if not tier_candidates:
+            print("[-] No download tiers found on movie page.")
+            return None
 
         selected_tier = None
         if episode_match:
@@ -178,19 +206,29 @@ def try_filmyzilla_scrape(query):
 
         r3 = session.get(selected_tier[1], timeout=12)
         soup3 = BeautifulSoup(r3.text, "html.parser")
-        server_links = [urljoin(FILMYZILLA_DOMAIN, a['href']) for a in soup3.find_all("a", href=True) if "/verified/" in a['href']]
+        server_links = [
+            urljoin(FILMYZILLA_DOMAIN, a['href']) 
+            for a in soup3.find_all("a", href=True) 
+            if any(k in a['href'] for k in ["/verified/", "/dload/", "download="])
+        ]
         
-        if not server_links: return None
+        if not server_links:
+            # Check if current page is already the final download redirect
+            if "download" in r3.url or ".mp4" in r3.url or ".mkv" in r3.url:
+                server_links = [r3.url]
+            else:
+                return None
 
-        res = session.get(server_links[0], stream=True, allow_redirects=True, timeout=15)
+        print(f"[+] Streaming from: {server_links[0]}")
+        res = session.get(server_links[0], stream=True, allow_redirects=True, timeout=20)
         if res.status_code == 200:
             local_dl = "temp_raw_stream.mkv"
             with open(local_dl, "wb") as f:
-                for chunk in res.iter_content(chunk_size=1024*1024):
+                for chunk in res.iter_content(chunk_size=2*1024*1024):
                     if chunk: f.write(chunk)
             return local_dl
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[-] Filmyzilla download error: {e}")
     return None
 
 # --- SOURCE 2: ANIMAHd SCRAPER ---
@@ -204,31 +242,28 @@ async def try_animahd_scrape(query):
         episode_match = re.search(r'\bs\d{1,2}e(\d{1,2})\b', query, re.IGNORECASE)
     
     base_title = re.sub(r'\b(?:s|season)\s*\d{1,2}\s*(?:e|ep|episode)\s*\d{1,2}\b|\b(?:e|ep|episode)\s*\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
-    
+    clean_query = clean_text(base_title)
+
     try:
         r = session.get(f"{ANIMAHD_DOMAIN}/?s={quote(base_title)}", timeout=12)
-        if r.status_code != 200: return None
+        if r.status_code != 200: 
+            return None
         soup = BeautifulSoup(r.text, "html.parser")
         
         ignore_links = ["/filter/", "/anime-schedule/", "/dmca/", "/terms/", "/about/", "/contact/"]
-        
         anime_page_url = None
+
+        # STRICT CHECK ONLY: Eliminate the blind fallback that downloaded unrelated anime
         for a in soup.find_all("a", href=True):
             href = a['href']
+            text = a.get_text()
             if ANIMAHD_DOMAIN in href and not any(ig in href.lower() for ig in ignore_links) and href.strip('/') != ANIMAHD_DOMAIN.strip('/'):
-                if clean_text(base_title) in clean_text(a.get_text()):
+                if clean_query in clean_text(text) or clean_text(text) in clean_query:
                     anime_page_url = href
                     break
                     
         if not anime_page_url:
-            for a in soup.find_all("a", href=True):
-                href = a['href']
-                if ANIMAHD_DOMAIN in href and not any(ig in href.lower() for ig in ignore_links) and href.strip('/') != ANIMAHD_DOMAIN.strip('/'):
-                    anime_page_url = href
-                    break
-            
-        if not anime_page_url:
-            print("[-] Series page not found on AnimaHD.")
+            print(f"[-] Not found on AnimaHD. Skipping (avoids grabbing incorrect anime)...")
             return None
 
         print(f"[*] Found Series Page: {anime_page_url}")
@@ -254,7 +289,6 @@ async def try_animahd_scrape(query):
         if ep_matches:
             ep_matches.sort(key=lambda x: x[0], reverse=True)
             target_ep_link = ep_matches[0][2]
-            print(f"[*] Selected episode link: '{ep_matches[0][1]}' (Score: {ep_matches[0][0]})")
         elif episode_links:
             episode_links.sort(key=lambda x: x[0], reverse=True)
             target_ep_link = episode_links[0][2]
@@ -263,7 +297,7 @@ async def try_animahd_scrape(query):
             print("[-] Episode link not found on series page.")
             return None
             
-        print(f"[*] Dispatching headless browser to bypass anti-bot gateway...")
+        print(f"[*] Dispatching headless browser...")
         install_browser_engine()
         from playwright.async_api import async_playwright
         
@@ -273,7 +307,6 @@ async def try_animahd_scrape(query):
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            
             context = await browser.new_context(user_agent=HEADERS["User-Agent"], accept_downloads=True)
             page = await context.new_page()
             
@@ -290,69 +323,47 @@ async def try_animahd_scrape(query):
             await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font"] else route.continue_())
             page.on("request", lambda req: captured_urls.append(req.url))
 
-            print(f"[*] Browser loading Player Link: {target_ep_link}")
             try:
                 await page.goto(target_ep_link, timeout=30000)
-            except Exception:
-                pass
-                
-            print("[*] Waiting for JS timers to redirect to gateway...")
-            try:
-                await page.wait_for_url(re.compile(r"animesuki\.online|target=|gate="), timeout=15000)
+                await page.wait_for_url(re.compile(r"animesuki\.online|target=|gate="), timeout=12000)
             except Exception:
                 pass
                 
             current_url = page.url
-            print(f"[+] Reached Gateway: {current_url}")
-            
             if "target=" in current_url:
-                print("[*] Target found in URL! Skipping countdowns and ads...")
                 parsed = urlparse(current_url)
                 q_params = parse_qs(parsed.query)
                 if "target" in q_params:
                     decoded = decode_base64_string(q_params["target"][0])
                     if decoded:
                         final_url = decoded
-                        print(f"[+] Successfully decoded teleport link -> {final_url}")
             
             if final_url:
                 if "eid=" in final_url and "passed=" not in final_url:
                     final_url += "&passed=1" if "?" in final_url else "?passed=1"
-                print(f"[*] Teleporting directly to final host...")
                 try:
                     await page.goto(final_url, timeout=20000)
                 except Exception:
                     pass
             
-            print(f"[+] Final Reached Host: {page.url}")
-            
-            print("[*] Executing multi-step JS button sequence...")
-            click_sequence = [
-                r"Download Episode",
-                r"Click Again to Continue",
-                r"Final Step"
-            ]
-            
+            click_sequence = [r"Download Episode", r"Click Again to Continue", r"Final Step"]
             for step_regex in click_sequence:
                 try:
                     btn = page.get_by_text(re.compile(step_regex, re.IGNORECASE)).first
-                    if await btn.is_visible(timeout=8000):
-                        print(f"[+] Human Sim: Clicking '{step_regex}'")
+                    if await btn.is_visible(timeout=6000):
                         await btn.click(force=True)
                         await page.wait_for_timeout(2000)
                 except Exception:
                     pass
             
             local_dl = "temp_animahd_stream.mkv"
-            
             try:
-                download_obj = await asyncio.wait_for(asyncio.shield(download_future), timeout=15.0)
-                print(f"[+] Native browser download triggered! Saving to disk (Bypasses 403)...")
+                download_obj = await asyncio.wait_for(asyncio.shield(download_future), timeout=12.0)
                 await download_obj.save_as(local_dl)
                 await browser.close()
                 return local_dl
             except asyncio.TimeoutError:
-                print("[-] No immediate native download detected. Searching network interceptor logs...")
+                pass
             
             scored_captured = []
             for url in captured_urls:
@@ -364,7 +375,6 @@ async def try_animahd_scrape(query):
             if scored_captured:
                 scored_captured.sort(key=lambda x: x[0], reverse=True)
                 download_url = scored_captured[0][1]
-                print(f"[+] Intercepted media request (Score: {scored_captured[0][0]}): {download_url}")
                     
             if not download_url:
                 links = await page.query_selector_all("a")
@@ -381,50 +391,21 @@ async def try_animahd_scrape(query):
                     download_url = found_links[0][1]
 
             if download_url:
-                print(f"[+] Forcing native browser navigation to bypass Cloudflare 403...")
                 try:
                     async with page.expect_download(timeout=90000) as dl_info:
-                        try:
-                            await page.evaluate("url => window.location.href = url", download_url)
-                        except Exception:
-                            pass
-                    
+                        await page.evaluate("url => window.location.href = url", download_url)
                     download = await dl_info.value
-                    print("[+] Native download successfully intercepted! Saving to disk...")
                     await download.save_as(local_dl)
                     await browser.close()
                     return local_dl
                 except Exception:
-                    print(f"[-] Native download check timed out. Verifying if it is an HTML page (like Google Drive)...")
-                    
-                    active_pages = context.pages
-                    drive_page = None
-                    for p_tab in active_pages:
-                        if "drive.google.com" in p_tab.url:
-                            drive_page = p_tab
-                            break
-                            
-                    if drive_page:
-                        print("[*] Caught Google Drive Virus Scan warning! Clicking bypass...")
-                        try:
-                            await drive_page.wait_for_selector("form#download-form", timeout=10000)
-                            async with drive_page.expect_download(timeout=120000) as drive_dl_info:
-                                await drive_page.evaluate("document.querySelector('form#download-form').submit()")
-                            drive_dl = await drive_dl_info.value
-                            print("[+] Google Drive bypass successful! Saving to disk...")
-                            await drive_dl.save_as(local_dl)
-                            await browser.close()
-                            return local_dl
-                        except Exception as drive_e:
-                            print(f"[-] Failed to bypass Google Drive: {drive_e}")
-                    else:
-                        print(f"[-] Stream could not be forced via JS. Failing back...")
+                    pass
 
             await browser.close()
         return None
 
     except Exception as e:
-        print(f"[-] AnimaHD browser scraper error: {e}")
+        print(f"[-] AnimaHD error: {e}")
         return None
 
 # --- SOURCE 3: TELEGRAM BOTS FALLBACK ---
@@ -524,7 +505,7 @@ def transcode_and_upload(source_file, title_label):
     is_a_safe = a_codec in ["aac", "mp3", "ac3"]
     
     if is_v_safe and is_a_safe:
-        print("[+] File is 100% compatible with old TVs. Remuxing instantly (stream copy)...")
+        print("[+] Stream is fully TV-compliant. Remuxing instantaneously...")
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", source_file,
             "-c", "copy",
@@ -532,7 +513,7 @@ def transcode_and_upload(source_file, title_label):
             final_output
         ]
     elif is_v_safe and not is_a_safe:
-        print("[*] Video is compatible, but audio is incompatible. Copying video & converting audio to AAC...")
+        print("[*] Remuxing video and transcoding audio to AAC...")
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", source_file,
             "-c:v", "copy",
@@ -541,7 +522,7 @@ def transcode_and_upload(source_file, title_label):
             final_output
         ]
     else:
-        print("[!] Video is HEVC/10-bit. Transcoding to 8-bit H.264 Level 4.1 for old TV compatibility...")
+        print("[!] Re-encoding to universal 8-bit H.264 profile for legacy TV support...")
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", source_file,
             "-vf", "scale='min(1920,iw)':-2",
@@ -581,17 +562,14 @@ async def main():
 
     downloaded = None
 
-    # Step 1: Execute Web Scrapers (if mode is 'web' or 'all')
     if RUN_MODE in ["web", "all"]:
         downloaded = try_filmyzilla_scrape(MOVIE_NAME)
         if not downloaded:
             downloaded = await try_animahd_scrape(MOVIE_NAME)
 
-    # Step 2: Execute Telegram Fallback (if mode is 'telegram' or 'all' with fallback)
     if not downloaded and RUN_MODE in ["telegram", "all"]:
         downloaded = await try_telegram_bots(MOVIE_NAME)
 
-    # Process and Report Results
     if downloaded:
         transcode_and_upload(downloaded, MOVIE_NAME)
         sync_movies_json()
