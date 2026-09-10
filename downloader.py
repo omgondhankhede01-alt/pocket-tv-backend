@@ -9,30 +9,6 @@ import requests
 import base64
 import unicodedata
 import socket
-import unicodedata
-import re
-
-def clean_search_query(query):
-    if not query:
-        return ""
-    nfkd_form = unicodedata.normalize('NFKD', query)
-    ascii_str = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
-    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', ascii_str)
-    return re.sub(r'\s+', ' ', cleaned).strip()
-
-def get_smart_search_queries(raw_query):
-    sanitized = clean_search_query(raw_query)
-    queries = [sanitized]
-    
-    # If query contains specific episode syntax (e.g., S09E196), generate fallbacks
-    match = re.search(r'(.*?)\b[sS]\d{1,2}[eE]\d{1,3}\b', sanitized)
-    if match:
-        base_series = match.group(1).strip()
-        if base_series and base_series not in queries:
-            queries.append(base_series)
-            
-    return queries
-
 
 from urllib.parse import urljoin, quote, quote_plus, urlparse, parse_qs
 from telethon import TelegramClient
@@ -69,6 +45,41 @@ HEADERS = {
 
 STOP_WORDS = {"the", "a", "an", "of", "in", "on", "and", "or", "to", "for", "with", "at", "by", "hindi", "dubbed", "english", "movie", "series"}
 
+# =========================================================
+# SMART QUERY VARIATION ENGINE
+# =========================================================
+def generate_search_variations(raw_query):
+    variations = []
+    
+    def add_var(v):
+        if v and v not in variations:
+            variations.append(v)
+            
+    # 1. Original Exact Query
+    add_var(raw_query)
+    
+    # 2. Normalized Unicode (e.g., Naruto Shippūden -> Naruto Shippuden)
+    nfkd_form = unicodedata.normalize('NFKD', raw_query)
+    ascii_str = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
+    add_var(ascii_str)
+    
+    # 3. Base Title Stripped of Season/Episode Tags safely
+    base_title = re.sub(r'\s*[sS](?:eason)?\s*\d{1,2}\s*[eE](?:p|pisode)?\s*\d{1,3}.*', '', ascii_str, flags=re.IGNORECASE).strip()
+    base_title = re.sub(r'\s*[eE](?:p|pisode)?\s*\d{1,3}.*', '', base_title, flags=re.IGNORECASE).strip()
+    add_var(base_title)
+    
+    # 4. Punctuation Replaced with Spaces (Spider-Man -> Spider Man)
+    spaced = re.sub(r'[^a-zA-Z0-9\s]', ' ', base_title)
+    spaced = re.sub(r'\s+', ' ', spaced).strip()
+    add_var(spaced)
+    
+    # 5. Completely Compacted (Spider-Man -> Spiderman)
+    compacted = re.sub(r'[^a-zA-Z0-9]', '', base_title)
+    add_var(compacted)
+    
+    return variations
+
+
 def set_github_output(name, value):
     output_file = os.environ.get("GITHUB_OUTPUT")
     if output_file:
@@ -78,14 +89,12 @@ def set_github_output(name, value):
         except Exception:
             pass
 
-# Replaces all punctuation with spaces so "Spider-Man:" becomes "spider man"
 def clean_text(text):
     if not text:
         return ""
     normalized = unicodedata.normalize('NFKD', str(text)).encode('ascii', 'ignore').decode('utf-8')
     return re.sub(r'[^a-zA-Z0-9]+', ' ', normalized).lower().strip()
 
-# Strips all whitespace and punctuation for exact substring validation
 def compact_text(text):
     if not text:
         return ""
@@ -112,33 +121,24 @@ def sanitize_title(title):
 
 def get_quality_score(text):
     t = str(text).lower()
-    if re.search(r'\b(1080p|1080|fhd|full\s*hd)\b', t):
-        return 100
-    if re.search(r'\b(720p|720)\b', t):
-        return 90
-    if re.search(r'\b(hd|high\s*def)\b', t):
-        return 80
-    if re.search(r'\b(2160p|4k|uhd)\b', t):
-        return -50
-    if re.search(r'\b(480p|360p|240p|sd|dvdrip)\b', t):
-        return 30
-    if re.search(r'\b(camrip|cam|ts)\b', t):
-        return 20
+    if re.search(r'\b(1080p|1080|fhd|full\s*hd)\b', t): return 100
+    if re.search(r'\b(720p|720)\b', t): return 90
+    if re.search(r'\b(hd|high\s*def)\b', t): return 80
+    if re.search(r'\b(2160p|4k|uhd)\b', t): return -50
+    if re.search(r'\b(480p|360p|240p|sd|dvdrip)\b', t): return 30
+    if re.search(r'\b(camrip|cam|ts)\b', t): return 20
     return 40
 
 def is_title_match(target_title, candidate_title):
     t_clean = clean_text(target_title)
     c_clean = clean_text(candidate_title)
-    
     t_compact = compact_text(target_title)
     c_compact = compact_text(candidate_title)
     
-    # 1. Compact check: "spidermanbrandnewday" inside "spidermanbrandnewday2026englishmovie"
     if t_compact and c_compact:
         if t_compact in c_compact or c_compact in t_compact:
             return True, 1.0
 
-    # 2. Tokenized check
     t_words = [w for w in t_clean.split() if w not in STOP_WORDS]
     if not t_words:
         t_words = t_clean.split()
@@ -150,10 +150,8 @@ def is_title_match(target_title, candidate_title):
     matched = [w for w in t_words if w in c_words]
     ratio = len(matched) / len(t_words)
 
-    # Allow matches if 50% or more key words match
     if ratio >= 0.50:
         return True, ratio
-
     return False, ratio
 
 def get_drive_service():
@@ -194,66 +192,61 @@ def decode_base64_string(encoded_str):
     except Exception:
         return None
 
-def try_filmyzilla_scrape(query):
-    if not BeautifulSoup:
-        return None
-    print(f"\n[Source: Filmyzilla] Searching {FILMYZILLA_DOMAIN} for: '{query}'...")
+# =========================================================
+# SCRAPERS
+# =========================================================
+def try_filmyzilla_scrape(search_query, original_query):
+    if not BeautifulSoup: return None
+    print(f"\n[Source: Filmyzilla] Searching {FILMYZILLA_DOMAIN} for: '{search_query}'...")
     session = requests.Session()
     session.headers.update(HEADERS)
     
-    episode_match = re.search(r'\bE(\d{1,2})\b', query, re.IGNORECASE)
-    base_title = re.sub(r'\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
+    # Extract episode requirements from original query
+    episode_match = re.search(r'\b(?:e|ep|episode)\s*(\d{1,2})\b', original_query, re.IGNORECASE)
+    if not episode_match:
+        episode_match = re.search(r'\bs\d{1,2}e(\d{1,2})\b', original_query, re.IGNORECASE)
     
-    # Strip punctuation to create clean search phrases
-    cleaned_base = clean_text(base_title)
-    core_title = re.sub(r'\b(the\s+movie|movie|reze\s+arc|arc)\b.*$', '', cleaned_base, flags=re.IGNORECASE).strip()
-    if not core_title or len(core_title) < 3:
-        core_title = cleaned_base.split()[0] if cleaned_base.split() else cleaned_base
+    ascii_orig = "".join([c for c in unicodedata.normalize('NFKD', original_query) if not unicodedata.combining(c)])
+    base_match_title = re.sub(r'\s*[sS](?:eason)?\s*\d{1,2}\s*[eE](?:p|pisode)?\s*\d{1,3}.*', '', ascii_orig).strip()
+    if not base_match_title: base_match_title = ascii_orig
 
-    search_terms = [cleaned_base, core_title]
+    slug = re.sub(r'[^a-zA-Z0-9]+', '-', search_query).strip('-').lower()
+    search_urls = [
+        f"{FILMYZILLA_DOMAIN}/search/{slug}.html",
+        f"{FILMYZILLA_DOMAIN}/search.php?q={quote_plus(search_query)}"
+    ]
+    
     soup = None
-
-    for term in search_terms:
-        if not term:
+    for s_url in search_urls:
+        try:
+            r = session.get(s_url, timeout=12)
+            if r.status_code == 200 and len(r.text) > 800:
+                temp_soup = BeautifulSoup(r.text, "html.parser")
+                found = [a for a in temp_soup.find_all("a", href=True) if any(k in a['href'] for k in ["/movie/", "/files/", "/file/"])]
+                if found:
+                    soup = temp_soup
+                    print(f"[*] Search matched using query: '{search_query}'")
+                    break
+        except Exception:
             continue
-        slug = re.sub(r'[^a-zA-Z0-9]+', '-', term).strip('-').lower()
-        search_urls = [
-            f"{FILMYZILLA_DOMAIN}/search/{slug}.html",
-            f"{FILMYZILLA_DOMAIN}/search.php?q={quote_plus(term)}"
-        ]
-        for s_url in search_urls:
-            try:
-                r = session.get(s_url, timeout=12)
-                if r.status_code == 200 and len(r.text) > 800:
-                    temp_soup = BeautifulSoup(r.text, "html.parser")
-                    found = [a for a in temp_soup.find_all("a", href=True) if any(k in a['href'] for k in ["/movie/", "/files/", "/file/"])]
-                    if found:
-                        soup = temp_soup
-                        print(f"[*] Search matched using query: '{term}'")
-                        break
-            except Exception:
-                continue
-        if soup:
-            break
 
     if not soup:
         print("[-] Filmyzilla search returned 0 results.")
         return None
 
     scored_candidates = []
-
     for a in soup.find_all("a", href=True):
         href = a['href']
         text = a.get_text(strip=True)
         if any(seg in href for seg in ["/movie/", "/files/", "/series/", "/file/"]):
-            matched, ratio = is_title_match(base_title, text)
+            matched, ratio = is_title_match(base_match_title, text)
             if matched:
                 full_href = urljoin(FILMYZILLA_DOMAIN, href)
                 quality_score = get_quality_score(text)
                 scored_candidates.append((ratio, quality_score, text, full_href))
 
     if not scored_candidates:
-        print(f"[-] No valid candidates matched '{base_title}' on Filmyzilla.")
+        print(f"[-] No valid candidates matched '{base_match_title}' on Filmyzilla.")
         return None
 
     scored_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -272,8 +265,7 @@ def try_filmyzilla_scrape(query):
                 score = get_quality_score(txt)
                 tier_candidates.append((score, txt, href))
 
-        if not tier_candidates:
-            return None
+        if not tier_candidates: return None
 
         selected_tier = None
         if episode_match:
@@ -309,31 +301,29 @@ def try_filmyzilla_scrape(query):
             local_dl = "temp_raw_stream.mkv"
             with open(local_dl, "wb") as f:
                 for chunk in res.iter_content(chunk_size=2*1024*1024):
-                    if chunk: 
-                        f.write(chunk)
+                    if chunk: f.write(chunk)
             return local_dl
     except Exception as e:
         print(f"[-] Filmyzilla stream error: {e}")
     return None
 
-async def try_animahd_scrape(query):
-    if not BeautifulSoup:
-        return None
-    print(f"\n[Source: AnimaHD] Searching {ANIMAHD_DOMAIN} for: '{query}'...")
+async def try_animahd_scrape(search_query, original_query):
+    if not BeautifulSoup: return None
+    print(f"\n[Source: AnimaHD] Searching {ANIMAHD_DOMAIN} for: '{search_query}'...")
     session = requests.Session()
     session.headers.update(HEADERS)
     
-    episode_match = re.search(r'\b(?:e|ep|episode)\s*(\d{1,2})\b', query, re.IGNORECASE)
+    episode_match = re.search(r'\b(?:e|ep|episode)\s*(\d{1,2})\b', original_query, re.IGNORECASE)
     if not episode_match:
-        episode_match = re.search(r'\bs\d{1,2}e(\d{1,2})\b', query, re.IGNORECASE)
+        episode_match = re.search(r'\bs\d{1,2}e(\d{1,2})\b', original_query, re.IGNORECASE)
     
-    base_title = re.sub(r'\b(?:s|season)\s*\d{1,2}\s*(?:e|ep|episode)\s*\d{1,2}\b|\b(?:e|ep|episode)\s*\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b', '', query, flags=re.IGNORECASE).strip()
-    clean_target = clean_text(base_title)
+    ascii_orig = "".join([c for c in unicodedata.normalize('NFKD', original_query) if not unicodedata.combining(c)])
+    base_match_title = re.sub(r'\s*[sS](?:eason)?\s*\d{1,2}\s*[eE](?:p|pisode)?\s*\d{1,3}.*', '', ascii_orig).strip()
+    if not base_match_title: base_match_title = ascii_orig
 
     try:
-        r = session.get(f"{ANIMAHD_DOMAIN}/?s={quote(clean_target)}", timeout=12)
-        if r.status_code != 200: 
-            return None
+        r = session.get(f"{ANIMAHD_DOMAIN}/?s={quote(search_query)}", timeout=12)
+        if r.status_code != 200: return None
         soup = BeautifulSoup(r.text, "html.parser")
         
         ignore_links = ["/filter/", "/anime-schedule/", "/dmca/", "/terms/", "/about/", "/contact/"]
@@ -343,7 +333,7 @@ async def try_animahd_scrape(query):
             href = a['href']
             text = a.get_text()
             if ANIMAHD_DOMAIN in href and not any(ig in href.lower() for ig in ignore_links) and href.strip('/') != ANIMAHD_DOMAIN.strip('/'):
-                matched, _ = is_title_match(base_title, text)
+                matched, _ = is_title_match(base_match_title, text)
                 if matched:
                     anime_page_url = href
                     break
@@ -383,7 +373,7 @@ async def try_animahd_scrape(query):
             print("[-] No matching episode links on series page.")
             return None
             
-        print(f"[*] Dispatching headless browser...")
+        print(f"[*] Dispatching headless browser to retrieve streams...")
         install_browser_engine()
         from playwright.async_api import async_playwright
         
@@ -400,8 +390,7 @@ async def try_animahd_scrape(query):
             download_future = loop.create_future()
             
             def _on_download(d):
-                if not download_future.done():
-                    download_future.set_result(d)
+                if not download_future.done(): download_future.set_result(d)
                     
             page.on("download", _on_download)
             context.on("page", lambda new_page: new_page.on("download", _on_download))
@@ -412,8 +401,7 @@ async def try_animahd_scrape(query):
             try:
                 await page.goto(target_ep_link, timeout=30000)
                 await page.wait_for_url(re.compile(r"animesuki\.online|target=|gate="), timeout=12000)
-            except Exception:
-                pass
+            except Exception: pass
                 
             current_url = page.url
             if "target=" in current_url:
@@ -421,16 +409,14 @@ async def try_animahd_scrape(query):
                 q_params = parse_qs(parsed.query)
                 if "target" in q_params:
                     decoded = decode_base64_string(q_params["target"][0])
-                    if decoded:
-                        final_url = decoded
+                    if decoded: final_url = decoded
             
             if final_url:
                 if "eid=" in final_url and "passed=" not in final_url:
                     final_url += "&passed=1" if "?" in final_url else "?passed=1"
                 try:
                     await page.goto(final_url, timeout=20000)
-                except Exception:
-                    pass
+                except Exception: pass
             
             click_sequence = [r"Download Episode", r"Click Again to Continue", r"Final Step"]
             for step_regex in click_sequence:
@@ -439,8 +425,7 @@ async def try_animahd_scrape(query):
                     if await btn.is_visible(timeout=6000):
                         await btn.click(force=True)
                         await page.wait_for_timeout(2000)
-                except Exception:
-                    pass
+                except Exception: pass
             
             local_dl = "temp_animahd_stream.mkv"
             try:
@@ -448,8 +433,7 @@ async def try_animahd_scrape(query):
                 await download_obj.save_as(local_dl)
                 await browser.close()
                 return local_dl
-            except asyncio.TimeoutError:
-                pass
+            except asyncio.TimeoutError: pass
             
             scored_captured = []
             for url in captured_urls:
@@ -484,8 +468,7 @@ async def try_animahd_scrape(query):
                     await download.save_as(local_dl)
                     await browser.close()
                     return local_dl
-                except Exception:
-                    pass
+                except Exception: pass
 
             await browser.close()
         return None
@@ -494,13 +477,12 @@ async def try_animahd_scrape(query):
         print(f"[-] AnimaHD error: {e}")
         return None
 
-async def try_telegram_bots(query):
+async def try_telegram_bots(search_query, original_query):
     if not SESSION_STRING:
         print("[-] TG_SESSION is not set.")
         return None
 
-    clean_bot_query = clean_text(query)
-    print(f"\n[Source: Telegram] Engaging bots for: '{clean_bot_query}' (Raw: '{query}')...")
+    print(f"\n[Source: Telegram] Engaging bots for: '{search_query}'...")
     client = None
     try:
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -513,7 +495,7 @@ async def try_telegram_bots(query):
         for bot in ACTIVE_BOTS:
             print(f"[*] Querying bot: {bot}...")
             try:
-                sent_msg = await client.send_message(bot, clean_bot_query)
+                sent_msg = await client.send_message(bot, search_query)
                 out_id = sent_msg.id
             except Exception as e:
                 print(f"[-] Could not send to {bot}: {e}")
@@ -527,25 +509,22 @@ async def try_telegram_bots(query):
                     if msg.buttons:
                         for row in msg.buttons:
                             for btn in row:
-                                matched, _ = is_title_match(query, btn.text)
+                                matched, _ = is_title_match(original_query, btn.text)
                                 score = get_quality_score(btn.text)
                                 if matched or score >= 80:
                                     try:
                                         await btn.click()
                                         await asyncio.sleep(2)
-                                    except Exception:
-                                        pass
+                                    except Exception: pass
 
                     if (msg.media or msg.document or msg.video) and msg.id not in [m.id for m in media_messages]:
                         media_messages.append(msg)
                 
                 if media_messages:
                     best_current_score = max([get_quality_score(f"{getattr(m.file, 'name', '')} {m.text or ''}") for m in media_messages])
-                    if best_current_score >= 80:
-                        break
+                    if best_current_score >= 80: break
                         
-                if len(media_messages) >= 2 and (time.time() - start_time > 12):
-                    break
+                if len(media_messages) >= 2 and (time.time() - start_time > 12): break
                 await asyncio.sleep(2)
 
             if media_messages:
@@ -554,7 +533,7 @@ async def try_telegram_bots(query):
                     f_name = getattr(m.file, 'name', '') or ''
                     caption = m.text or ''
                     full_desc = f"{f_name} {caption}"
-                    matched, ratio = is_title_match(query, full_desc)
+                    matched, ratio = is_title_match(original_query, full_desc)
                     score = get_quality_score(full_desc)
                     if matched or ratio >= 0.4:
                         scored_msgs.append((score, m, f_name))
@@ -585,9 +564,7 @@ def probe_file_streams(filepath):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
         info = json.loads(proc.stdout)
-        video_codec = None
-        pix_fmt = None
-        audio_codec = None
+        video_codec, pix_fmt, audio_codec = None, None, None
         
         for s in info.get("streams", []):
             c_type = s.get("codec_type")
@@ -614,32 +591,13 @@ def transcode_and_upload(source_file, title_label):
     
     if is_v_safe and is_a_safe:
         print("[+] TV compliant streams detected. Remuxing with +faststart header...")
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-i", source_file,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            final_output
-        ]
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", source_file, "-c", "copy", "-movflags", "+faststart", final_output]
     elif is_v_safe and not is_a_safe:
         print("[*] Video is compatible; converting audio to stereo AAC with +faststart...")
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-i", source_file,
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-            "-movflags", "+faststart",
-            final_output
-        ]
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", source_file, "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-movflags", "+faststart", final_output]
     else:
         print("[!] Re-encoding to universal Sony TV H.264 profile...")
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-i", source_file,
-            "-vf", "scale='min(1920,iw)':-2",
-            "-c:v", "libx264", "-profile:v", "high", "-level", "4.1",
-            "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-            "-movflags", "+faststart",
-            final_output
-        ]
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", source_file, "-vf", "scale='min(1920,iw)':-2", "-c:v", "libx264", "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-movflags", "+faststart", final_output]
     
     proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
     upload_target = final_output if proc.returncode == 0 and os.path.exists(final_output) else source_file
@@ -656,55 +614,60 @@ def transcode_and_upload(source_file, title_label):
     print(f"[+] Upload complete! File ID: {file_id}")
     
     try:
-        service.permissions().create(
-            fileId=file_id, 
-            body={"type": "anyone", "role": "reader"}
-        ).execute(num_retries=5)
+        service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute(num_retries=5)
         print("[+] Public view permission enabled.")
     except Exception as e:
         print(f"[-] Permission warning: {e}")
     
     for f in [source_file, final_output]:
         if os.path.exists(f):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
+            try: os.remove(f)
+            except Exception: pass
 
+# =========================================================
+# MAIN ORCHESTRATOR
+# =========================================================
 async def main():
     if not MOVIE_NAME:
         sys.exit(1)
 
     print(f"[*] Starting universal search and scrape for: '{MOVIE_NAME}'")
+    
+    # Let the engine automatically generate fallback queries
+    search_variations = generate_search_variations(MOVIE_NAME)
+    print(f"[*] Generated search variations string to test: {search_variations}")
 
     downloaded = None
 
-    if RUN_MODE in ["web", "all"]:
-        # 1. Try Filmyzilla first for any media type
-        downloaded = try_filmyzilla_scrape(MOVIE_NAME)
+    # Loop through each generated variant until one finally hits gold
+    for query_variant in search_variations:
+        print(f"\n=======================================================")
+        print(f"[*] ATTEMPTING SCRAPE WITH VARIANT: '{query_variant}'")
+        print(f"=======================================================")
         
-        # 2. If Filmyzilla doesn't have it, universally fall back to AnimaHD
-        if not downloaded:
-            print("[*] Filmyzilla returned no result. Trying AnimaHD...")
-            downloaded = await try_animahd_scrape(MOVIE_NAME)
+        if RUN_MODE in ["web", "all"]:
+            downloaded = try_filmyzilla_scrape(query_variant, MOVIE_NAME)
+            if not downloaded:
+                downloaded = await try_animahd_scrape(query_variant, MOVIE_NAME)
 
-    if not downloaded and RUN_MODE in ["telegram", "all"]:
-        downloaded = await try_telegram_bots(MOVIE_NAME)
+        if not downloaded and RUN_MODE in ["telegram", "all"]:
+            downloaded = await try_telegram_bots(query_variant, MOVIE_NAME)
 
+        if downloaded:
+            print(f"[+] Successfully found and downloaded file using query variation: '{query_variant}'")
+            break
+
+    # Resolve output
     if downloaded:
         transcode_and_upload(downloaded, MOVIE_NAME)
         sync_movies_json()
         set_github_output("downloaded", "true")
-        print("[+] Download and sync completed successfully.")
+        print("[+] Processing and sync completed successfully.")
         sys.exit(0)
     else:
         set_github_output("downloaded", "false")
-        if RUN_MODE == "web":
-            print("[*] Web scrapers did not find the file. Proceeding to Telegram fallback...")
-            sys.exit(0)
-        else:
-            print("[-] All sources exhausted.")
-            sys.exit(1)
+        print("[-] All search variations and sources exhausted. File could not be found.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
