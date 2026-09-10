@@ -9,6 +9,37 @@ import requests
 import base64
 import unicodedata
 import socket
+import unicodedata
+import re
+
+def clean_search_query(query):
+    if not query:
+        return ""
+    # Normalize unicode characters (converts 'ū' -> 'u', etc.)
+    nfkd_form = unicodedata.normalize('NFKD', query)
+    ascii_str = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
+    
+    # Clean up extra symbols while preserving season/episode tags
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', ascii_str)
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+# --- Integration Example in your Scraper Flow ---
+def execute_search(raw_query):
+    sanitized_query = clean_search_query(raw_query)
+    print(f"[*] Original query: '{raw_query}'")
+    print(f"[*] Sanitized query for scraping: '{sanitized_query}'")
+    
+    # Example fallback logic: If exact episode search fails, search base title
+    if "S" in sanitized_query and "E" in sanitized_query:
+        base_series = sanitized_query.split('S')[0].strip()
+        print(f"[*] Fallback option available for series: '{base_series}'")
+    
+    return sanitized_query
+
+if __name__ == "__main__":
+    # Test sample
+    execute_search("Naruto Shippūden S09E196")
+
 from urllib.parse import urljoin, quote, quote_plus, urlparse, parse_qs
 from telethon import TelegramClient
 from telethon.sessions import StringSession
