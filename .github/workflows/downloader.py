@@ -35,7 +35,7 @@ ACTIVE_BOTS = [
     "@iPapkornA2bot"
 ]
 
-FILMYZILLA_DOMAIN = "https://www.filmyzilla67.com"
+FILMYZILLA_DOMAIN = "https://www.filmyzilla68.com"
 ANIMAHD_DOMAIN = "https://animahd.com"
 
 HEADERS = {
